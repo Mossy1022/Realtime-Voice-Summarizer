@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Realtime Voice Summary</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+      .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+      button { padding: 0.5rem 0.8rem; }
+      #summary { white-space: pre-wrap; border: 1px solid #ddd; padding: 1rem; border-radius: 8px; min-height: 6rem; }
+      .small { color: #666; font-size: 0.9rem; }
+      audio { display: block; margin-top: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Realtime Voice Summary</h1>
+    <div class="row">
+      <button id="connect">Connect + Mic</button>
+      <button id="disconnect" disabled>Disconnect</button>
+      <button id="test-voice" disabled>Test Voice</button>
+      <span id="status" class="small">Idle</span>
+    </div>
+
+    <h3>Summary (auto-updates after each turn)</h3>
+    <div id="summary">Say something and then pause…</div>
+
+    <!-- Assistant voice output -->
+    <audio id="assistant-audio" autoplay playsinline controls></audio>
+
+    <div id="app-root"></div>
+
+    <script type="module">
+      import React from 'https://esm.sh/react@18';
+      import { createRoot } from 'https://esm.sh/react-dom@18/client';
+      import App from './app.js';
+      const root = createRoot(document.getElementById('app-root'));
+      root.render(React.createElement(App));
+    </script>
+  </body>
+</html>
