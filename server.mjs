@@ -1,7 +1,8 @@
 // server.mjs
-// Static server + two OpenAI entry points:
-// 1) /session  -> Ephemeral WebRTC session for VOICE (Realtime) [audio + text]
-// 2) /summary  -> REST summarizer (Responses API), decoupled from voice
+// Static server + three endpoints:
+// 1) GET  /session  -> Ephemeral WebRTC session for VOICE (Realtime) [audio + text]
+// 2) POST /summary  -> REST summarizer (Responses API)
+// 3) POST /state    -> REST extractor that produces a compact "Perspective State" JSON
 // Node 18+ (global fetch). No deps.
 
 import http from 'node:http';
@@ -26,20 +27,26 @@ async function readJson(req) {
   });
 }
 
-/** Ephemeral Realtime session for VOICE (WebRTC). */
+/**
+ * VOICE ENGINE (Realtime / WebRTC)
+ * We do NOT target a "Custom GPT". Realtime expects a base model with instructions and optional tools.
+ * We give it a tight persona geared to probing for missing info (Perspective Coach).
+ */
 async function createEphemeralSession() {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
 
   const body = {
     model: 'gpt-realtime',
-    modalities: ['audio', 'text'], // text for transcript only; UI won’t render it
+    // Include text so we can capture assistant transcripts (UI won’t render this text)
+    modalities: ['audio', 'text'],
     voice: 'alloy',
     turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
     instructions: [
-      'You are a helpful voice assistant.',
+      'You are the Perspective Coach.',
       'Speak only in English (US).',
-      'Respond naturally via audio to each user utterance. Provide concise text alongside audio for transcription.',
-      'Do not send standalone summaries unless explicitly requested.'
+      'Your job is to help the user clarify goals, facts, constraints, options, decisions, next steps, risks.',
+      'When you answer, be concise and ask one highly targeted follow-up question that fills the biggest gap you see.',
+      'You will be provided Context containing a running Summary and a compact State JSON; use those to avoid repetition and to probe gaps.'
     ].join(' ')
   };
 
@@ -60,7 +67,11 @@ async function createEphemeralSession() {
   };
 }
 
-/** REST summarizer: { transcript:[{role,text}], partial?, mode:'live'|'final' } -> { summary } */
+/**
+ * SUMMARY ENGINE
+ * Input:  { transcript:[{role,text}], partial?, mode:'live'|'final' }
+ * Output: { summary:string }
+ */
 async function summarize(payload) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
 
@@ -73,10 +84,10 @@ async function summarize(payload) {
   const prompt = [
     'You are a real-time conversation summarizer.',
     'Return ONE updated summary (1–2 sentences) of the conversation so far.',
-    'Capture intent, decisions, constraints, next steps. Avoid parroting or quotes.',
+    'Capture intent, decisions, constraints, and next steps; avoid quoting or paraphrasing verbatim.',
     mode === 'live'
-      ? 'You may receive a partial, in-progress user utterance; integrate it cautiously without echoing.'
-      : 'This is a definitive post-turn refresh; ensure it reflects the latest assistant reply.',
+      ? 'A partial, in-progress user utterance may be included; integrate it cautiously without echoing.'
+      : 'This is a definitive post-turn refresh; reflect the latest assistant reply.',
     '',
     'Transcript (most recent last):',
     lines || '(no prior turns)',
@@ -104,10 +115,91 @@ async function summarize(payload) {
   return { summary: (text || '').trim() };
 }
 
+/**
+ * STATE EXTRACTOR (Perspective State)
+ * Input:  { transcript:[{role,text}], partial?, mode:'live'|'final' }
+ * Output: { state:{goals,facts,questions,options,decisions,next_steps,risks} }
+ * We ask for strict JSON; we still harden with a best-effort JSON parse.
+ */
+async function extractState(payload) {
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
+
+  const { transcript = [], partial = '', mode = 'final' } = payload || {};
+  const lines = transcript
+    .slice(-30)
+    .map(({ role, text }) => `${role.toUpperCase()}: ${text.replace(/\s+/g, ' ').trim()}`)
+    .join('\n');
+
+  const schema = `{
+    "goals":        {"type":"array","items":{"type":"string"}},
+    "facts":        {"type":"array","items":{"type":"string"}},
+    "questions":    {"type":"array","items":{"type":"string"}},
+    "options":      {"type":"array","items":{"type":"string"}},
+    "decisions":    {"type":"array","items":{"type":"string"}},
+    "next_steps":   {"type":"array","items":{"type":"string"}},
+    "risks":        {"type":"array","items":{"type":"string"}}
+  }`;
+
+  const prompt = [
+    'Extract a compact "Perspective State" JSON from the conversation.',
+    'Focus on abstractions; deduplicate; keep each item short and specific.',
+    mode === 'live'
+      ? 'Partial user utterance may be present; include provisional items cautiously (no quotes).'
+      : 'This is a definitive refresh; collapse repetition.',
+    '',
+    'Return ONLY a JSON object with exactly these top-level keys:',
+    'goals, facts, questions, options, decisions, next_steps, risks.',
+    'Each must be an array of strings.',
+    '',
+    'Transcript (most recent last):',
+    lines || '(no prior turns)',
+    partial ? `\nPartial user utterance: ${partial.replace(/\s+/g, ' ').trim()}` : ''
+  ].join('\n');
+
+  const res = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-4o-mini', input: prompt })
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`State extractor error: ${res.status} ${res.statusText} — ${txt}`);
+  }
+  const data = await res.json();
+  let raw = '';
+  if (Array.isArray(data.output_text)) raw = data.output_text.join('');
+  else if (typeof data.output_text === 'string') raw = data.output_text;
+  else if (data.output?.[0]?.content?.[0]?.text) raw = data.output[0].content[0].text;
+  else if (data.content?.[0]?.text) raw = data.content[0].text;
+  else if (typeof data.text === 'string') raw = data.text;
+
+  // Hardened JSON extraction
+  let state = {
+    goals: [], facts: [], questions: [], options: [], decisions: [], next_steps: [], risks: []
+  };
+  try {
+    // try direct parse
+    state = JSON.parse(raw);
+  } catch {
+    // try to locate first {...} block
+    const i = raw.indexOf('{');
+    const j = raw.lastIndexOf('}');
+    if (i !== -1 && j !== -1 && j > i) {
+      try { state = JSON.parse(raw.slice(i, j + 1)); } catch {}
+    }
+  }
+  // Final shape guard
+  for (const k of ['goals','facts','questions','options','decisions','next_steps','risks']) {
+    if (!Array.isArray(state[k])) state[k] = [];
+    state[k] = state[k].filter(v => typeof v === 'string').slice(0, 12);
+  }
+  return { state };
+}
+
 /** Static files */
 function serveStatic(req, res) {
   const requestUrl = new URL(req.url, `http://${req.headers.host}`);
-  let pathname = requestUrl.pathname.replace(/\/+$/, ''); // strip trailing slash
+  let pathname = requestUrl.pathname.replace(/\/+$/, '');
   if (pathname === '') pathname = '/index.html';
   const filePath = path.join(PUBLIC_DIR, path.normalize(pathname));
   if (!filePath.startsWith(PUBLIC_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
@@ -116,8 +208,8 @@ function serveStatic(req, res) {
     const ext = path.extname(filePath).toLowerCase();
     const type =
       ext === '.html' ? 'text/html; charset=utf-8' :
-      ext === '.js' ? 'text/javascript; charset=utf-8' :
-      ext === '.css' ? 'text/css; charset=utf-8' :
+      ext === '.js'   ? 'text/javascript; charset=utf-8' :
+      ext === '.css'  ? 'text/css; charset=utf-8' :
       ext === '.json' ? 'application/json; charset=utf-8' :
       'application/octet-stream';
     res.writeHead(200, { 'Content-Type': type });
@@ -128,27 +220,26 @@ function serveStatic(req, res) {
 const server = http.createServer(async (req, res) => {
   try {
     const requestUrl = new URL(req.url, `http://${req.headers.host}`);
-    const pathname = requestUrl.pathname.replace(/\/+$/, ''); // normalize
+    const pathname = requestUrl.pathname.replace(/\/+$/, '');
 
-    // Ephemeral session for voice (GET /session)
+    // CORS preflight helper
+    const withCORS = () => res.setHeader('Access-Control-Allow-Origin', '*');
+
     if (req.method === 'GET' && pathname === '/session') {
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      withCORS();
       const session = await createEphemeralSession();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(session));
       return;
     }
 
-    // REST summarizer (POST /summary) + CORS preflight
     if (pathname === '/summary') {
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      withCORS();
       if (req.method === 'OPTIONS') {
         res.writeHead(204, {
           'Access-Control-Allow-Methods': 'POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type'
-        });
-        res.end();
-        return;
+        }); res.end(); return;
       }
       if (req.method !== 'POST') { res.writeHead(405); res.end('Method Not Allowed'); return; }
       const body = await readJson(req);
@@ -158,7 +249,22 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Static
+    if (pathname === '/state') {
+      withCORS();
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        }); res.end(); return;
+      }
+      if (req.method !== 'POST') { res.writeHead(405); res.end('Method Not Allowed'); return; }
+      const body = await readJson(req);
+      const out = await extractState(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(out));
+      return;
+    }
+
     serveStatic(req, res);
   } catch (err) {
     res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });

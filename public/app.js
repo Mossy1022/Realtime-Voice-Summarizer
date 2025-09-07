@@ -1,48 +1,37 @@
 // public/app.js
-// Two-engine architecture:
-// - VOICE ENGINE: WebRTC Realtime (audio + text for transcript only).
-// - SUMMARY ENGINE: REST /summary (independent). UI renders ONLY summaries.
+// Two-engine app:
+//  - VOICE ENGINE (Realtime WebRTC): speaks back; we pass Summary + State for probing questions.
+//  - SUMMARY/STATE ENGINE (REST): returns {summary} and {state} to render UI.
 //
-// Fixes:
-// - Explicitly create a voice response on end-of-speech (no more silent turns).
-// - During speech, call the REST summarizer in 'live' mode (contextual live updates; no parroting).
-// - After the assistant finishes talking, call a 'final' summary and render it.
-// - Strict single-flight per engine; display never shows voice text.
+// Rules:
+//  - During speech: throttle /summary (mode:'live') and /state (mode:'live').
+//  - After assistant reply: call /summary(mode:'final') and /state(mode:'final').
+//  - Display renders ONLY summaries, never voice text.
 
 import React, { useEffect, useRef, useState } from 'https://esm.sh/react@18';
 
-/** Wait for RTCPeerConnection to be fully connected. */
+// ---------- helpers ----------
+
 function waitForConnected(pc) {
   if (pc.connectionState === 'connected') return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const onChange = () => {
-      if (pc.connectionState === 'connected') {
-        pc.removeEventListener('connectionstatechange', onChange);
-        resolve();
-      } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        pc.removeEventListener('connectionstatechange', onChange);
-        reject(new Error(`Peer connection ${pc.connectionState}`));
-      }
+    const on = () => {
+      if (pc.connectionState === 'connected') { pc.removeEventListener('connectionstatechange', on); resolve(); }
+      else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') { pc.removeEventListener('connectionstatechange', on); reject(new Error(`Peer connection ${pc.connectionState}`)); }
     };
-    pc.addEventListener('connectionstatechange', onChange);
+    pc.addEventListener('connectionstatechange', on);
   });
 }
 
-/** Create the VOICE engine session (WebRTC). */
 async function connectRealtime() {
   const sessRes = await fetch('/session');
   if (!sessRes.ok) throw new Error('Failed to get ephemeral session');
   const { client_secret, base_url, model } = await sessRes.json();
   if (!client_secret) throw new Error('No client_secret returned');
 
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-  });
-
-  // Negotiate an m=audio recv line
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   pc.addTransceiver('audio', { direction: 'recvonly' });
 
-  // Remote audio playback
   const audioEl = document.getElementById('assistant-audio');
   let remoteStream = new MediaStream();
   pc.ontrack = (ev) => {
@@ -56,10 +45,8 @@ async function connectRealtime() {
     }
   };
 
-  // Data channel for JSON events
   const dc = pc.createDataChannel('oai-events');
 
-  // Mic to peer
   const mic = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
   });
@@ -70,10 +57,7 @@ async function connectRealtime() {
 
   const sdpRes = await fetch(`${base_url}?model=${encodeURIComponent(model)}`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${client_secret}`,
-      'Content-Type': 'application/sdp'
-    },
+    headers: { Authorization: `Bearer ${client_secret}`, 'Content-Type': 'application/sdp' },
     body: offer.sdp
   });
   if (!sdpRes.ok) {
@@ -92,57 +76,99 @@ async function connectRealtime() {
   return { pc, dc, stop };
 }
 
-/** REST summarizer. */
-async function callSummarizer(payload) {
-  const res = await fetch('/summary', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) throw new Error(`Summarizer ${res.status}`);
-  const j = await res.json();
-  return j?.summary || '';
+async function postJSON(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`${url} ${res.status}`);
+  return res.json();
 }
 
-/** Throttle helper. */
 function throttle(fn, ms) {
   let t = 0; let timer = 0; let lastArgs = null;
   return (...args) => {
     lastArgs = args;
     const now = Date.now(), rem = ms - (now - t);
     if (rem <= 0) { t = now; fn(...lastArgs); }
-    else if (!timer) {
-      timer = window.setTimeout(() => { t = Date.now(); timer = 0; fn(...lastArgs); }, rem);
-    }
+    else if (!timer) { timer = window.setTimeout(() => { t = Date.now(); timer = 0; fn(...lastArgs); }, rem); }
   };
 }
+
+// ---------- UI: very light diagram ----------
+
+function renderViz(el, state) {
+  if (!el) return;
+  const cols = [
+    ['goals', 'Goals'],
+    ['facts', 'Facts'],
+    ['questions', 'Questions'],
+    ['options', 'Options'],
+    ['decisions', 'Decisions'],
+    ['next_steps', 'Next steps'],
+    ['risks', 'Risks']
+  ];
+  const html = cols.map(([k, label]) => {
+    const items = (state?.[k] || []).map(v => `<span class="pill">${escapeHtml(v)}</span>`).join('');
+    return `<div class="card"><h4>${label}</h4>${items || '<div class="small">—</div>'}</div>`;
+  }).join('');
+  el.innerHTML = html;
+}
+function escapeHtml(s) { return (s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+// ---------- App ----------
 
 export default function App() {
   const [status, setStatus] = useState('Idle');
   const [summary, setSummary] = useState('Say something and then pause…');
 
   const connRef = useRef(null);
+  const transcriptRef = useRef([]); // [{role,text,ts}]
+  const summaryRef = useRef('Say something and then pause…');
+  const stateRef = useRef({ goals:[], facts:[], questions:[], options:[], decisions:[], next_steps:[], risks:[] });
 
-  // Conversation transcript we feed the summarizer
-  /** @type {React.MutableRefObject<Array<{role:'user'|'assistant', text:string, ts:number}>>} */
-  const transcriptRef = useRef([]);
-
-  // VOICE engine state
+  // VOICE engine trackers
   const voiceRidRef = useRef(null);
   const voiceTextBufRef = useRef('');
   const voiceBusyRef = useRef(false);
   const pendingVoiceRef = useRef(false);
 
-  // User speech via Web Speech API (for 'live' summaries)
+  // SpeechRecognition
   const srRef = useRef(null);
   const srActiveRef = useRef(false);
   const interimRef = useRef('');
 
-  // Summary engine gates
-  const liveInFlightRef = useRef(false);
-  const finalInFlightRef = useRef(false);
+  // throttled REST calls
+  const callLiveSummary = throttle(async () => {
+    const out = await postJSON('/summary', {
+      transcript: transcriptRef.current.map(({ role, text }) => ({ role, text })),
+      partial: interimRef.current, mode: 'live'
+    });
+    if (out?.summary) { setSummary(out.summary); summaryRef.current = out.summary; }
+    setStatus('Listening…');
+  }, 900);
 
-  /** Proactive greeting (audio + text; UI ignores the text). */
+  const callLiveState = throttle(async () => {
+    const out = await postJSON('/state', {
+      transcript: transcriptRef.current.map(({ role, text }) => ({ role, text })),
+      partial: interimRef.current, mode: 'live'
+    });
+    if (out?.state) {
+      stateRef.current = out.state;
+      renderViz(document.getElementById('viz'), stateRef.current);
+    }
+  }, 1100);
+
+  async function callFinalSummaryAndState() {
+    setStatus('Summarizing…');
+    const [s, st] = await Promise.all([
+      postJSON('/summary', { transcript: transcriptRef.current.map(({ role, text }) => ({ role, text })), mode: 'final' }),
+      postJSON('/state',   { transcript: transcriptRef.current.map(({ role, text }) => ({ role, text })), mode: 'final' })
+    ]);
+    if (s?.summary) { setSummary(s.summary); summaryRef.current = s.summary; }
+    if (st?.state) { stateRef.current = st.state; renderViz(document.getElementById('viz'), stateRef.current); }
+    setStatus('Waiting for next turn…');
+  }
+
+  // ----- VOICE helpers -----
+
   function sendGreeting() {
     if (!connRef.current) return;
     voiceBusyRef.current = true;
@@ -156,27 +182,36 @@ export default function App() {
     }));
   }
 
-  /** Explicitly ask the voice engine to answer after user speech stops. */
   function sendVoiceReply() {
     if (!connRef.current) return;
     if (voiceBusyRef.current) { pendingVoiceRef.current = true; return; }
     voiceBusyRef.current = true;
     voiceRidRef.current = null;
     voiceTextBufRef.current = '';
+
+    // Give the model current context (summary + state) so it can probe gaps
+    const context = [
+      'Context Summary:', summaryRef.current,
+      'Context State JSON:', JSON.stringify(stateRef.current)
+    ].join('\n');
+
     connRef.current.dc.send(JSON.stringify({
       type: 'response.create',
       response: {
         modalities: ['audio', 'text'],
         metadata: { kind: 'voice_turn' },
         instructions: [
+          context,
           'Answer naturally in English to the most recent user utterance.',
-          'Do not repeat the user verbatim; respond to their intent and advance the conversation.'
-        ].join(' ')
+          'Ask one short, targeted follow-up question that best fills a gap in the Context State.',
+          'Avoid repeating the user verbatim.'
+        ].join('\n')
       }
     }));
   }
 
-  /** Start interim ASR and stream live summaries via REST (decoupled). */
+  // ----- SpeechRecognition -----
+
   function startInterimRecognition() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR || srActiveRef.current) return;
@@ -188,8 +223,10 @@ export default function App() {
       let text = '';
       for (let i = e.resultIndex; i < e.results.length; i++) text += e.results[i][0]?.transcript || '';
       interimRef.current = text.trim();
-      // Live, contextual summary (REST) — throttle + single-flight
-      requestLiveSummary();
+      if (interimRef.current.length >= 6) {
+        // live REST updates (decoupled from voice)
+        try { await Promise.allSettled([callLiveSummary(), callLiveState()]); } catch {}
+      }
     };
     sr.onend = () => { srActiveRef.current = false; };
     sr.onerror = () => { srActiveRef.current = false; };
@@ -202,64 +239,23 @@ export default function App() {
     srActiveRef.current = false;
   }
 
-  const requestLiveSummary = throttle(async () => {
-    if (!interimRef.current || interimRef.current.trim().length < 6) return;
-    if (liveInFlightRef.current) return;
-    liveInFlightRef.current = true;
-    try {
-      const out = await callSummarizer({
-        transcript: transcriptRef.current.map(({ role, text }) => ({ role, text })),
-        partial: interimRef.current,
-        mode: 'live'
-      });
-      if (out) setSummary(out);
-      setStatus('Listening…');
-    } catch (e) {
-      // quiet fail for live
-    } finally {
-      liveInFlightRef.current = false;
-    }
-  }, 900);
+  // ----- Realtime event router (VOICE engine) -----
 
-  async function requestFinalSummary() {
-    if (finalInFlightRef.current) return;
-    finalInFlightRef.current = true;
-    setStatus('Summarizing…');
-    try {
-      const out = await callSummarizer({
-        transcript: transcriptRef.current.map(({ role, text }) => ({ role, text })),
-        mode: 'final'
-      });
-      if (out) setSummary(out);
-      setStatus('Waiting for next turn…');
-    } catch (e) {
-      console.error('Summarizer error:', e);
-      setStatus('Summary error');
-    } finally {
-      finalInFlightRef.current = false;
-    }
-  }
-
-  /** Route VOICE engine events. */
   function handleServerEvent(ev) {
     switch (ev?.type) {
-      // User VAD
       case 'input_audio_buffer.speech_started':
         startInterimRecognition();
         break;
 
       case 'input_audio_buffer.speech_stopped':
         stopInterimRecognition();
-        // Commit the last interim as a user turn
         if (interimRef.current.trim()) {
           transcriptRef.current.push({ role: 'user', text: interimRef.current.trim(), ts: Date.now() });
           interimRef.current = '';
         }
-        // Explicitly ask the voice engine to answer
         sendVoiceReply();
         break;
 
-      // New response created; track voice responses
       case 'response.created': {
         const id = ev?.response?.id;
         const mods = ev?.response?.modalities || [];
@@ -270,7 +266,6 @@ export default function App() {
         break;
       }
 
-      // Capture assistant text for transcript (not rendered)
       case 'response.output_text.delta':
       case 'response.text.delta': {
         const rid = ev?.response_id;
@@ -280,7 +275,6 @@ export default function App() {
         break;
       }
 
-      // Voice/text response finished
       case 'response.completed':
       case 'response.done': {
         const rid = ev?.response_id;
@@ -290,45 +284,42 @@ export default function App() {
           if (a) transcriptRef.current.push({ role: 'assistant', text: a, ts: Date.now() });
           voiceRidRef.current = null;
           voiceTextBufRef.current = '';
-          // Queue handling: if user spoke again during the reply, send next reply
           if (pendingVoiceRef.current) { pendingVoiceRef.current = false; sendVoiceReply(); }
-          // Final, authoritative summary now that the assistant finished
-          requestFinalSummary();
+          // Final authoritative refresh for summary + state
+          callFinalSummaryAndState();
         }
         break;
       }
 
       case 'response.error':
-      case 'error': {
-        // Most common: conversation_already_has_active_response -> we'll wait for done and retry next time.
+      case 'error':
         console.error('[realtime] error', ev);
-        voiceBusyRef.current = true;
+        setStatus('Model error (see console)');
+        voiceBusyRef.current = true; // wait for resolution before sending again
         break;
-      }
 
       default:
         break;
     }
   }
 
-  /** Connect / Disconnect */
+  // ----- Connect / Disconnect -----
+
   async function onConnect() {
     setStatus('Connecting…');
     try {
       const conn = await connectRealtime();
       connRef.current = conn;
 
-      // Unlock autoplay on click
       document.getElementById('assistant-audio')?.play?.().catch(() => {});
 
-      conn.dc.onmessage = (msg) => {
-        try { handleServerEvent(JSON.parse(msg.data)); } catch {}
-      };
+      conn.dc.onmessage = (msg) => { try { handleServerEvent(JSON.parse(msg.data)); } catch {} };
       conn.dc.onopen = async () => {
         setStatus('Negotiating…');
         try {
           await waitForConnected(conn.pc);
           setStatus('Mic live. Prompting…');
+          renderViz(document.getElementById('viz'), stateRef.current);
           sendGreeting();
           document.getElementById('test-voice').disabled = false;
         } catch (e) {

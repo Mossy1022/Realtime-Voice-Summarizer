@@ -11,6 +11,10 @@
       #summary { white-space: pre-wrap; border: 1px solid #ddd; padding: 1rem; border-radius: 8px; min-height: 6rem; }
       .small { color: #666; font-size: 0.9rem; }
       audio { display: block; margin-top: 1rem; }
+      #viz { display: grid; grid-template-columns: repeat(7, minmax(160px, 1fr)); gap: 12px; margin-top: 18px; }
+      .card { border: 1px solid #e5e5e5; border-radius: 10px; padding: 10px; }
+      .card h4 { margin: 0 0 8px 0; font-size: 0.95rem; }
+      .pill { display:inline-block; margin: 4px 4px 0 0; padding: 4px 8px; border-radius: 999px; border: 1px solid #ddd; font-size: 0.85rem; }
     </style>
   </head>
   <body>
@@ -25,7 +29,9 @@
     <h3>Summary (auto-updates after each turn)</h3>
     <div id="summary">Say something and then pause…</div>
 
-    <!-- Assistant voice output -->
+    <h3>Perspective State (live)</h3>
+    <div id="viz"></div>
+
     <audio id="assistant-audio" autoplay playsinline controls></audio>
 
     <div id="app-root"></div>
