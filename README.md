@@ -26,8 +26,11 @@ This architecture makes it possible to both chat naturally with a voice assistan
 ```
 
 realtime-voice-summary/
+.git/               # Git version control metadata
+README.md           # Project documentation
+package.json        # Project metadata and start script
+package-lock.json   # Lockfile for Node
 server.mjs          # Node server: /session (Realtime voice) + /summary (REST summarizer)
-package.json
 public/
 index.html        # Barebones page + React via ESM CDN
 app.js            # Client logic: voice engine + summary engine
@@ -46,10 +49,7 @@ styles.css        # Optional styling
 
 ## Getting Started
 
-### 1. Install dependencies
-No external packages required. Just ensure you’re on Node 18+.
-
-### 2. Set your API key
+### 1. Set your API key
 ```bash
 # macOS/Linux
 export OPENAI_API_KEY="sk-..."
@@ -59,15 +59,15 @@ setx OPENAI_API_KEY "sk-..."
 # then open a new terminal
 ````
 
-### 3. Run the server
+### 2. Run the server
 
 ```bash
 node server.mjs
 ```
 
-App runs at: [http://localhost:8080](http://localhost:8080)
+The app runs at: [http://localhost:8080](http://localhost:8080)
 
-### 4. Use the app
+### 3. Use the app
 
 * Open the app in Chrome.
 * Click **Connect + Mic** and allow microphone permissions.
@@ -87,7 +87,7 @@ App runs at: [http://localhost:8080](http://localhost:8080)
 
 * WebRTC session (`/session`) to the `gpt-realtime` model.
 * Streams mic audio → gets assistant voice back.
-* Provides text too, but UI ignores it; we use it only for transcript logging.
+* Provides text too, but UI ignores it; only used for transcript logging.
 
 **Summary Engine**
 
@@ -160,7 +160,7 @@ App runs at: [http://localhost:8080](http://localhost:8080)
   Check mic permissions. Verify `input_audio_buffer.speech_stopped` events fire when you pause.
 
 * **Text box echoes my words**
-  Expected briefly in *live* mode if partial input is too short. The *final* summary will replace it with an abstracted version.
+  Expected briefly in *live* mode if the partial input is too short. The *final* summary will replace it.
 
 * **favicon.ico 404**
   Harmless. Add a favicon or ignore.
@@ -171,7 +171,6 @@ App runs at: [http://localhost:8080](http://localhost:8080)
 
 * Persist transcript + summaries with timestamps.
 * Add function calling support (trigger actions from context).
-* UI controls: copy/export summary, change voices, toggle live updates.
 * Add TURN servers for networks that block WebRTC.
 
 ---
