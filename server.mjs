@@ -2,7 +2,7 @@
 // Static server + three endpoints:
 // 1) GET  /session  -> Ephemeral WebRTC session for VOICE (Realtime) [audio + text]
 // 2) POST /summary  -> REST summarizer (Responses API)
-// 3) POST /state    -> REST extractor that produces a compact "Perspective State" JSON
+// 3) POST /state    -> REST extractor producing "Perspective State" JSON
 // Node 18+ (global fetch). No deps.
 
 import http from 'node:http';
@@ -28,92 +28,101 @@ async function readJson(req) {
 }
 
 /**
- * VOICE ENGINE (Realtime / WebRTC)
- * We do NOT target a "Custom GPT". Realtime expects a base model with instructions and optional tools.
- * We give it a tight persona geared to probing for missing info (Perspective Coach).
+ * Create an ephemeral Realtime session for VOICE (WebRTC).
+ * Tools:
+ *  - update_state(add/remove arrays)
+ *  - persist_session(note)
  */
 async function createEphemeralSession() {
-    if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
-  
-    const body = {
-      model: 'gpt-realtime',
-      modalities: ['audio', 'text'], // text only for transcript/logging
-      voice: 'alloy',
-      turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
-  
-      // 1) Voice persona that knows a tool exists.
-      instructions: [
-        'You are the Perspective Coach. Speak English (US).',
-        'Purpose: help the user clarify goals, facts, constraints, options, decisions, next steps, risks.',
-        'When appropriate, call the tool update_state with a small patch (add/remove arrays) to update the live state.',
-        'After updating state, continue speaking naturally and ask one targeted follow-up. Do not wait for tool results.'
-      ].join(' '),
-  
-      // 2) Tool schema the model can call
-      tools: [
-        {
-          type: 'function',
-          name: 'update_state',
-          description: 'Add or remove short items in the live Perspective State.',
-          parameters: {
-            type: 'object',
-            properties: {
-              add: {
-                type: 'object',
-                properties: {
-                  goals: { type: 'array', items: { type: 'string' } },
-                  facts: { type: 'array', items: { type: 'string' } },
-                  questions: { type: 'array', items: { type: 'string' } },
-                  options: { type: 'array', items: { type: 'string' } },
-                  decisions: { type: 'array', items: { type: 'string' } },
-                  next_steps: { type: 'array', items: { type: 'string' } },
-                  risks: { type: 'array', items: { type: 'string' } }
-                },
-                additionalProperties: false
-              },
-              remove: {
-                type: 'object',
-                properties: {
-                  goals: { type: 'array', items: { type: 'string' } },
-                  facts: { type: 'array', items: { type: 'string' } },
-                  questions: { type: 'array', items: { type: 'string' } },
-                  options: { type: 'array', items: { type: 'string' } },
-                  decisions: { type: 'array', items: { type: 'string' } },
-                  next_steps: { type: 'array', items: { type: 'string' } },
-                  risks: { type: 'array', items: { type: 'string' } }
-                },
-                additionalProperties: false
-              }
-            },
-            additionalProperties: false
-          }
-        }
-      ]
-    };
-  
-    const res = await fetch('https://api.openai.com/v1/realtime/sessions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`Failed to create session: ${res.status} ${res.statusText} — ${txt}`);
-    }
-    const j = await res.json();
-    return {
-      client_secret: j?.client_secret?.value || null,
-      base_url: 'https://api.openai.com/v1/realtime',
-      model: j?.model || 'gpt-realtime'
-    };
-  }
-  
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
 
-/**
- * SUMMARY ENGINE
- * Input:  { transcript:[{role,text}], partial?, mode:'live'|'final' }
- * Output: { summary:string }
- */
+  const body = {
+    model: 'gpt-realtime',
+    modalities: ['audio', 'text'],
+    voice: 'alloy',
+    instructions: [
+      'You are the Perspective Coach. Speak English (US).',
+      'Purpose: help the user clarify goals, facts, constraints, options, decisions, next steps, risks.',
+      'When appropriate, call update_state with a small patch (add/remove arrays).',
+      'You may also call persist_session to save a durable snapshot; you will receive a session_id in the tool output.',
+      'Do NOT begin a new response unless the client sends response.create.',
+      'After any tool use, continue speaking naturally and ask one targeted follow-up that best fills a gap.'
+    ].join(' '),
+    tools: [
+      {
+        type: 'function',
+        name: 'update_state',
+        description: 'Add or remove short items in the live Perspective State.',
+        parameters: {
+          type: 'object',
+          properties: {
+            add: {
+              type: 'object',
+              properties: {
+                goals: { type: 'array', items: { type: 'string' } },
+                facts: { type: 'array', items: { type: 'string' } },
+                questions: { type: 'array', items: { type: 'string' } },
+                options: { type: 'array', items: { type: 'string' } },
+                decisions: { type: 'array', items: { type: 'string' } },
+                next_steps: { type: 'array', items: { type: 'string' } },
+                risks: { type: 'array', items: { type: 'string' } }
+              },
+              additionalProperties: false
+            },
+            remove: {
+              type: 'object',
+              properties: {
+                goals: { type: 'array', items: { type: 'string' } },
+                facts: { type: 'array', items: { type: 'string' } },
+                questions: { type: 'array', items: { type: 'string' } },
+                options: { type: 'array', items: { type: 'string' } },
+                decisions: { type: 'array', items: { type: 'string' } },
+                next_steps: { type: 'array', items: { type: 'string' } },
+                risks: { type: 'array', items: { type: 'string' } }
+              },
+              additionalProperties: false
+            }
+          },
+          additionalProperties: false
+        }
+      },
+      {
+        type: 'function',
+        name: 'persist_session',
+        description: 'Ask the host app to persist the current summary and state; returns a session_id you can reference later.',
+        parameters: {
+          type: 'object',
+          properties: {
+            note: { type: 'string', description: 'Optional note or title for this save point.' }
+          },
+          additionalProperties: false
+        }
+      }
+    ]
+  };
+
+  const res = await fetch('https://api.openai.com/v1/realtime/sessions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+      'OpenAI-Beta': 'realtime=v1'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Failed to create session: ${res.status} ${res.statusText} — ${txt}`);
+  }
+  const j = await res.json();
+  return {
+    client_secret: j?.client_secret?.value || null,
+    base_url: 'https://api.openai.com/v1/realtime',
+    model: j?.model || 'gpt-realtime'
+  };
+}
+
+/** ---------- SUMMARY ENGINE ---------- */
 async function summarize(payload) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
 
@@ -126,10 +135,10 @@ async function summarize(payload) {
   const prompt = [
     'You are a real-time conversation summarizer.',
     'Return ONE updated summary (1–2 sentences) of the conversation so far.',
-    'Capture intent, decisions, constraints, and next steps; avoid quoting or paraphrasing verbatim.',
+    'Capture intent, decisions, constraints, and next steps; avoid parroting.',
     mode === 'live'
-      ? 'A partial, in-progress user utterance may be included; integrate it cautiously without echoing.'
-      : 'This is a definitive post-turn refresh; reflect the latest assistant reply.',
+      ? 'A partial, in-progress user utterance may be included; integrate it cautiously.'
+      : 'This is a definitive post-turn refresh; include the latest assistant reply.',
     '',
     'Transcript (most recent last):',
     lines || '(no prior turns)',
@@ -157,12 +166,7 @@ async function summarize(payload) {
   return { summary: (text || '').trim() };
 }
 
-/**
- * STATE EXTRACTOR (Perspective State)
- * Input:  { transcript:[{role,text}], partial?, mode:'live'|'final' }
- * Output: { state:{goals,facts,questions,options,decisions,next_steps,risks} }
- * We ask for strict JSON; we still harden with a best-effort JSON parse.
- */
+/** ---------- STATE EXTRACTOR ---------- */
 async function extractState(payload) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
 
@@ -172,26 +176,12 @@ async function extractState(payload) {
     .map(({ role, text }) => `${role.toUpperCase()}: ${text.replace(/\s+/g, ' ').trim()}`)
     .join('\n');
 
-  const schema = `{
-    "goals":        {"type":"array","items":{"type":"string"}},
-    "facts":        {"type":"array","items":{"type":"string"}},
-    "questions":    {"type":"array","items":{"type":"string"}},
-    "options":      {"type":"array","items":{"type":"string"}},
-    "decisions":    {"type":"array","items":{"type":"string"}},
-    "next_steps":   {"type":"array","items":{"type":"string"}},
-    "risks":        {"type":"array","items":{"type":"string"}}
-  }`;
-
   const prompt = [
     'Extract a compact "Perspective State" JSON from the conversation.',
-    'Focus on abstractions; deduplicate; keep each item short and specific.',
+    'Keys: goals, facts, questions, options, decisions, next_steps, risks. Each is an array of short strings.',
     mode === 'live'
-      ? 'Partial user utterance may be present; include provisional items cautiously (no quotes).'
-      : 'This is a definitive refresh; collapse repetition.',
-    '',
-    'Return ONLY a JSON object with exactly these top-level keys:',
-    'goals, facts, questions, options, decisions, next_steps, risks.',
-    'Each must be an array of strings.',
+      ? 'Partial user utterance may be present; include cautiously (no quotes).'
+      : 'Definitive refresh; collapse repetition.',
     '',
     'Transcript (most recent last):',
     lines || '(no prior turns)',
@@ -215,22 +205,12 @@ async function extractState(payload) {
   else if (data.content?.[0]?.text) raw = data.content[0].text;
   else if (typeof data.text === 'string') raw = data.text;
 
-  // Hardened JSON extraction
-  let state = {
-    goals: [], facts: [], questions: [], options: [], decisions: [], next_steps: [], risks: []
-  };
-  try {
-    // try direct parse
-    state = JSON.parse(raw);
-  } catch {
-    // try to locate first {...} block
-    const i = raw.indexOf('{');
-    const j = raw.lastIndexOf('}');
-    if (i !== -1 && j !== -1 && j > i) {
-      try { state = JSON.parse(raw.slice(i, j + 1)); } catch {}
-    }
+  let state = { goals:[], facts:[], questions:[], options:[], decisions:[], next_steps:[], risks:[] };
+  try { state = JSON.parse(raw); }
+  catch {
+    const i = raw.indexOf('{'); const j = raw.lastIndexOf('}');
+    if (i !== -1 && j !== -1 && j > i) { try { state = JSON.parse(raw.slice(i, j + 1)); } catch {} }
   }
-  // Final shape guard
   for (const k of ['goals','facts','questions','options','decisions','next_steps','risks']) {
     if (!Array.isArray(state[k])) state[k] = [];
     state[k] = state[k].filter(v => typeof v === 'string').slice(0, 12);
@@ -238,7 +218,7 @@ async function extractState(payload) {
   return { state };
 }
 
-/** Static files */
+/** ---------- static files ---------- */
 function serveStatic(req, res) {
   const requestUrl = new URL(req.url, `http://${req.headers.host}`);
   let pathname = requestUrl.pathname.replace(/\/+$/, '');
@@ -264,11 +244,10 @@ const server = http.createServer(async (req, res) => {
     const requestUrl = new URL(req.url, `http://${req.headers.host}`);
     const pathname = requestUrl.pathname.replace(/\/+$/, '');
 
-    // CORS preflight helper
-    const withCORS = () => res.setHeader('Access-Control-Allow-Origin', '*');
+    const cors = () => res.setHeader('Access-Control-Allow-Origin', '*');
 
     if (req.method === 'GET' && pathname === '/session') {
-      withCORS();
+      cors();
       const session = await createEphemeralSession();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(session));
@@ -276,7 +255,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/summary') {
-      withCORS();
+      cors();
       if (req.method === 'OPTIONS') {
         res.writeHead(204, {
           'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -292,7 +271,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/state') {
-      withCORS();
+      cors();
       if (req.method === 'OPTIONS') {
         res.writeHead(204, {
           'Access-Control-Allow-Methods': 'POST, OPTIONS',

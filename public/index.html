@@ -22,17 +22,20 @@
     <div class="row">
       <button id="connect">Connect + Mic</button>
       <button id="disconnect" disabled>Disconnect</button>
-      <button id="test-voice" disabled>Test Voice</button>
       <span id="status" class="small">Idle</span>
     </div>
 
     <h3>Summary (auto-updates after each turn)</h3>
-    <div id="summary">Say something and then pause…</div>
+    <div id="summary">Say something and then press SPACE…</div>
 
     <h3>Perspective State (live)</h3>
     <div id="viz"></div>
 
     <audio id="assistant-audio" autoplay playsinline controls></audio>
+
+    <div id="ptt-indicator" class="small" style="margin-top:10px; color:#666;">
+      Press and hold <b>SPACE</b> to talk
+    </div>
 
     <div id="app-root"></div>
 
