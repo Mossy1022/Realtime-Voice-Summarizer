@@ -135,6 +135,39 @@ export default function App() {
   const srActiveRef = useRef(false);
   const interimRef = useRef('');
 
+  // Tool-call tracking
+const toolArgsByIdRef = useRef(new Map());   // call_id -> string (JSON buffer)
+const toolNameByIdRef = useRef(new Map());   // call_id -> name
+
+function applyStatePatch(patch) {
+  const dst = stateRef.current;
+  const uniq = (arr) => Array.from(new Set(arr.filter(Boolean).map(s => s.trim()).filter(Boolean)));
+  if (patch?.add) {
+    for (const k of Object.keys(patch.add)) {
+      dst[k] = uniq([...(dst[k] || []), ...patch.add[k]]);
+    }
+  }
+  if (patch?.remove) {
+    for (const k of Object.keys(patch.remove)) {
+      const rm = new Set(patch.remove[k].map(s => s.trim()));
+      dst[k] = (dst[k] || []).filter(s => !rm.has(s.trim()));
+    }
+  }
+  renderViz(document.getElementById('viz'), dst);
+}
+
+function sendToolOutput(callId, payload) {
+  // Non-blocking ack; many runtimes accept this shape.
+  try {
+    connRef.current?.dc?.send(JSON.stringify({
+      type: 'tool.output',
+      tool_call_id: callId,
+      output: JSON.stringify({ ok: true, ...payload })
+    }));
+  } catch {}
+}
+
+
   // throttled REST calls
   const callLiveSummary = throttle(async () => {
     const out = await postJSON('/summary', {
@@ -204,6 +237,7 @@ export default function App() {
           context,
           'Answer naturally in English to the most recent user utterance.',
           'Ask one short, targeted follow-up question that best fills a gap in the Context State.',
+          'If useful, call update_state(add/remove) with short items; then continue speaking and ask one targeted follow-up.',
           'Avoid repeating the user verbatim.'
         ].join('\n')
       }
@@ -274,6 +308,51 @@ export default function App() {
         }
         break;
       }
+
+       // Tool call started
+    case 'response.function_call.created':
+        case 'response.tool_call.created': {
+          const id = ev?.call?.id || ev?.tool_call?.id || ev?.id;
+          const name = ev?.call?.name || ev?.tool_call?.name || ev?.name;
+          if (id) {
+            toolArgsByIdRef.current.set(id, '');
+            if (name) toolNameByIdRef.current.set(id, name);
+          }
+          break;
+        }
+    
+        // Tool call argument streaming
+        case 'response.function_call.arguments.delta':
+        case 'response.tool_call.arguments.delta': {
+          const id = ev?.call_id || ev?.tool_call_id || ev?.id || ev?.response_id;
+          const d = ev?.delta || '';
+          if (id && d) {
+            const prev = toolArgsByIdRef.current.get(id) || '';
+            toolArgsByIdRef.current.set(id, prev + d);
+          }
+          break;
+        }
+    
+        // Tool call finished
+        case 'response.function_call.completed':
+        case 'response.tool_call.completed': {
+          const id = ev?.call_id || ev?.tool_call_id || ev?.id;
+          const name = toolNameByIdRef.current.get(id);
+          const raw = toolArgsByIdRef.current.get(id) || '{}';
+          let args = {};
+          try { args = JSON.parse(raw); } catch { /* ignore */ }
+    
+          if (name === 'update_state') {
+            applyStatePatch(args);
+            // Optional: immediately tighten the summary after tool effect
+            callFinalSummaryAndState();
+          }
+    
+          sendToolOutput(id, { received: true });
+          toolArgsByIdRef.current.delete(id);
+          toolNameByIdRef.current.delete(id);
+          break;
+        }
 
       case 'response.completed':
       case 'response.done': {

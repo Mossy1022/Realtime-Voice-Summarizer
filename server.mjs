@@ -33,39 +33,81 @@ async function readJson(req) {
  * We give it a tight persona geared to probing for missing info (Perspective Coach).
  */
 async function createEphemeralSession() {
-  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
-
-  const body = {
-    model: 'gpt-realtime',
-    // Include text so we can capture assistant transcripts (UI won’t render this text)
-    modalities: ['audio', 'text'],
-    voice: 'alloy',
-    turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
-    instructions: [
-      'You are the Perspective Coach.',
-      'Speak only in English (US).',
-      'Your job is to help the user clarify goals, facts, constraints, options, decisions, next steps, risks.',
-      'When you answer, be concise and ask one highly targeted follow-up question that fills the biggest gap you see.',
-      'You will be provided Context containing a running Summary and a compact State JSON; use those to avoid repetition and to probe gaps.'
-    ].join(' ')
-  };
-
-  const res = await fetch('https://api.openai.com/v1/realtime/sessions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Failed to create session: ${res.status} ${res.statusText} — ${txt}`);
+    if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set');
+  
+    const body = {
+      model: 'gpt-realtime',
+      modalities: ['audio', 'text'], // text only for transcript/logging
+      voice: 'alloy',
+      turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
+  
+      // 1) Voice persona that knows a tool exists.
+      instructions: [
+        'You are the Perspective Coach. Speak English (US).',
+        'Purpose: help the user clarify goals, facts, constraints, options, decisions, next steps, risks.',
+        'When appropriate, call the tool update_state with a small patch (add/remove arrays) to update the live state.',
+        'After updating state, continue speaking naturally and ask one targeted follow-up. Do not wait for tool results.'
+      ].join(' '),
+  
+      // 2) Tool schema the model can call
+      tools: [
+        {
+          type: 'function',
+          name: 'update_state',
+          description: 'Add or remove short items in the live Perspective State.',
+          parameters: {
+            type: 'object',
+            properties: {
+              add: {
+                type: 'object',
+                properties: {
+                  goals: { type: 'array', items: { type: 'string' } },
+                  facts: { type: 'array', items: { type: 'string' } },
+                  questions: { type: 'array', items: { type: 'string' } },
+                  options: { type: 'array', items: { type: 'string' } },
+                  decisions: { type: 'array', items: { type: 'string' } },
+                  next_steps: { type: 'array', items: { type: 'string' } },
+                  risks: { type: 'array', items: { type: 'string' } }
+                },
+                additionalProperties: false
+              },
+              remove: {
+                type: 'object',
+                properties: {
+                  goals: { type: 'array', items: { type: 'string' } },
+                  facts: { type: 'array', items: { type: 'string' } },
+                  questions: { type: 'array', items: { type: 'string' } },
+                  options: { type: 'array', items: { type: 'string' } },
+                  decisions: { type: 'array', items: { type: 'string' } },
+                  next_steps: { type: 'array', items: { type: 'string' } },
+                  risks: { type: 'array', items: { type: 'string' } }
+                },
+                additionalProperties: false
+              }
+            },
+            additionalProperties: false
+          }
+        }
+      ]
+    };
+  
+    const res = await fetch('https://api.openai.com/v1/realtime/sessions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`Failed to create session: ${res.status} ${res.statusText} — ${txt}`);
+    }
+    const j = await res.json();
+    return {
+      client_secret: j?.client_secret?.value || null,
+      base_url: 'https://api.openai.com/v1/realtime',
+      model: j?.model || 'gpt-realtime'
+    };
   }
-  const j = await res.json();
-  return {
-    client_secret: j?.client_secret?.value || null,
-    base_url: 'https://api.openai.com/v1/realtime',
-    model: j?.model || 'gpt-realtime'
-  };
-}
+  
 
 /**
  * SUMMARY ENGINE
