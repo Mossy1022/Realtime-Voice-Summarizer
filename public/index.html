@@ -31,10 +31,26 @@
     <h3>Perspective State (live)</h3>
     <div id="viz"></div>
 
+    <h3>Grid proposals (preview)</h3>
+    <div id="grid-proposals"></div>
+    <div style="margin-top:8px;">
+        <button onclick="alert('PV hand-off coming soon')">Open in Perspective Visualizer</button>
+    </div>
+
     <audio id="assistant-audio" autoplay playsinline controls></audio>
 
     <div id="ptt-indicator" class="small" style="margin-top:10px; color:#666;">
       Press and hold <b>SPACE</b> to talk
+    </div>
+
+     <!-- Confirm gate UI -->
+     <div id="confirm-wrap" class="small" style="margin-top:8px;">
+      <button id="confirm-speak" disabled style="padding:6px 10px;font:inherit;border-radius:6px;border:1px solid #ddd;cursor:not-allowed;background:#f8f8f8;">
+        ✅ Confirm & Speak
+      </button>
+      <span id="confirm-hint" style="margin-left:8px;color:#666;">
+        (Or hold SPACE and say “go ahead” / “please proceed”)
+      </span>
     </div>
 
     <div id="app-root"></div>

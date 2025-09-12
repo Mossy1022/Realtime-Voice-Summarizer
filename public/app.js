@@ -1,12 +1,6 @@
 // public/app.js
-// PTT + single-finalize-per-turn + robust transcription + auto-reply cancel while holding
-// - VAD ON for transcripts (server_vad) — configured on connect
-// - Cancel any response.created that happens while SPACE is held (no talk-over)
-// - Mute remote audio during PTT and while a canceled auto-reply is being cleared
-// - Run /state and /summary once per assistant response
-// - Handle tool calls via response.create { tool_outputs: [...] }
-// - Early (live) /state refresh on input_audio_transcription.completed for snappier viz
-// - Force input_audio_buffer.commit on keyup to guarantee a user turn
+// PTT + single-finalize-per-turn + robust transcription
+// + Speak-After-Confirm gate (no voice replies after greeting until user confirms)
 
 import React, { useEffect, useRef, useState } from 'https://esm.sh/react@18';
 
@@ -142,6 +136,158 @@ export default function App(){
   const stateRef=useRef({goals:[],facts:[],questions:[],options:[],decisions:[],next_steps:[],risks:[]});
   const idMapRef=useRef(new Map());
 
+  // Definition Gate
+  const gateOpenRef = useRef(false);
+  const defPackRef    = useRef(null);     // holds the accepted pack object/string
+  const consentRef    = useRef(false);
+
+  // ---- Minimal PV-like grid model + proposals ----
+  const gridMDRef = useRef({
+    options: new Set(),              // row ids
+    criteria: new Set(),             // column ids
+    cells: new Map()                 // key: `${opt}|${crit}` -> { weight, conf, rationale }
+  });
+  const proposalsRef = useRef([]);   // [{ id, type, option, criterion, weight, conf, rationale, source, ts }]
+
+  function kCell(o,c){ return `${(o||'').trim().toLowerCase()}|${(c||'').trim().toLowerCase()}`; }
+  function pKey(p){ return [p.type, (p.option||'').toLowerCase(), (p.criterion||'').toLowerCase()].join('|'); }
+
+  function enqueueProposals(list){
+    const seen = new Set(proposalsRef.current.map(p=>pKey(p)));
+    for(const p of list){
+      const key = pKey(p);
+      if(!seen.has(key)){ proposalsRef.current.push({ id: genId('gp'), ts: Date.now(), source: p.source||'heuristic', ...p }); seen.add(key); }
+    }
+    renderGridPanel();
+  }
+
+  function renderGridPanel(){
+    const el = document.getElementById('grid-proposals');
+    if(!el) return;
+    const rows = proposalsRef.current.map(p=>{
+      let desc = '';
+      if(p.type==='add_option') desc = `Add option: <b>${escapeHtml(p.option)}</b>`;
+      else if(p.type==='add_criterion') desc = `Add criterion: <b>${escapeHtml(p.criterion)}</b>`;
+      else if(p.type==='set_cell') desc = `Set <b>${escapeHtml(p.option)}</b> × <b>${escapeHtml(p.criterion)}</b> → weight ${p.weight} (conf ${Math.round((p.conf||0)*100)}%)`;
+      return `
+        <div class="gp-row" data-id="${p.id}" style="border:1px solid #eee;border-radius:8px;padding:8px;margin:6px 0;">
+          <div class="small" style="color:#888;margin-bottom:2px;">${new Date(p.ts).toLocaleTimeString()} • ${p.source}</div>
+          <div>${desc}${p.rationale ? ` — <i>${escapeHtml(p.rationale)}</i>` : ''}</div>
+          <div style="margin-top:6px;">
+            <button class="gp-accept">Accept</button>
+            <button class="gp-edit">Edit</button>
+            <button class="gp-discard">Discard</button>
+          </div>
+        </div>`;
+    }).join('') || '<div class="small" style="color:#666;">No proposals yet.</div>';
+
+    const summary = `
+      <div class="small" style="color:#666;margin-bottom:6px;">
+        Structure: ${gridMDRef.current.options.size} option(s), ${gridMDRef.current.criteria.size} criterion/criteria, ${gridMDRef.current.cells.size} cell(s)
+      </div>`;
+
+    el.innerHTML = summary + rows;
+
+    // event delegation
+    el.onclick = (e)=>{
+      const row = e.target.closest('.gp-row'); if(!row) return;
+      const id  = row.dataset.id;
+      const p   = proposalsRef.current.find(x=>x.id===id);
+      if(!p) return;
+
+      if(e.target.classList.contains('gp-accept')) acceptProposal(p.id);
+      if(e.target.classList.contains('gp-edit'))   editProposal(p.id);
+      if(e.target.classList.contains('gp-discard')) discardProposal(p.id);
+    };
+  }
+
+  function showDefinitionGateUI(draftText) {
+    let wrap = document.getElementById('defgate');
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = 'defgate';
+      document.body.appendChild(wrap);
+    }
+    wrap.innerHTML = `
+      <div style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:9999">
+        <div style="background:#fff;color:#222;max-width:520px;width:90%;border-radius:8px;padding:14px;box-shadow:0 12px 30px rgba(0,0,0,.25)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <h3 style="margin:0;font:700 1rem system-ui">Definition Gate</h3>
+            <button id="defgate-close" style="border:0;background:none;font-size:20px;cursor:pointer">×</button>
+          </div>
+          <p style="margin:8px 0 6px">Review or edit the decision definition, then accept:</p>
+          <textarea id="defgate-text" style="width:100%;min-height:160px;border:1px solid #ddd;border-radius:6px;padding:8px;font:14px/1.4 system-ui">${(draftText||'').replaceAll('<','&lt;')}</textarea>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+            <button id="defgate-accept" style="background:#0b57d0;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer">Accept</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.getElementById('defgate-close').onclick = () => { wrap.remove(); };
+    document.getElementById('defgate-accept').onclick = () => {
+      try {
+        const txt = /** @type {HTMLTextAreaElement} */(document.getElementById('defgate-text')).value.trim();
+        defPackRef.current = txt.startsWith('{') ? JSON.parse(txt) : txt; // allow plain text or JSON
+        consentRef.current = true;
+        gateOpenRef.current = false;
+        wrap.remove();
+        console.log('[defgate] accepted pack:', defPackRef.current);
+      } catch {
+        alert('Invalid JSON. Paste plain text or valid JSON object.');
+      }
+    };
+  }
+
+  function acceptProposal(id){
+    const idx = proposalsRef.current.findIndex(p=>p.id===id);
+    if(idx<0) return;
+    const p = proposalsRef.current[idx];
+    const grid = gridMDRef.current;
+
+    if(p.type==='add_option'){
+      grid.options.add(p.option);
+      const opt = (p.option||'').trim();
+      if(opt && !stateRef.current.options?.some?.(s => s.trim().toLowerCase()===opt.toLowerCase())){
+        stateRef.current.options = stateRef.current.options || [];
+        stateRef.current.options.push(opt);
+        renderViz(document.getElementById('viz'), stateRef.current);
+      }
+    }else if(p.type==='add_criterion'){
+      grid.criteria.add(p.criterion);
+    }else if(p.type==='set_cell'){
+      if(p.option) grid.options.add(p.option);
+      if(p.criterion) grid.criteria.add(p.criterion);
+      grid.cells.set(kCell(p.option,p.criterion), { weight: p.weight|0, conf: Math.max(0,Math.min(1,p.conf||0)), rationale: p.rationale||'' });
+    }
+
+    proposalsRef.current.splice(idx,1);
+    renderGridPanel();
+  }
+
+  function editProposal(id){
+    const p = proposalsRef.current.find(x=>x.id===id); if(!p) return;
+    if(p.type==='set_cell'){
+      const w = prompt('Weight (−100..+100):', String(p.weight ?? 0));
+      if(w==null) return;
+      const c = prompt('Confidence (0..1):', String(p.conf ?? 0.6));
+      if(c==null) return;
+      const r = prompt('Rationale:', p.rationale || '');
+      p.weight = Math.max(-100, Math.min(100, parseFloat(w)||0));
+      p.conf   = Math.max(0, Math.min(1, parseFloat(c)||0));
+      p.rationale = (r||'').trim();
+    }else if(p.type==='add_option'){
+      const v = prompt('Option name:', p.option||''); if(v==null) return; p.option=(v||'').trim();
+    }else if(p.type==='add_criterion'){
+      const v = prompt('Criterion name:', p.criterion||''); if(v==null) return; p.criterion=(v||'').trim();
+    }
+    renderGridPanel();
+  }
+
+  function discardProposal(id){
+    const i = proposalsRef.current.findIndex(x=>x.id===id);
+    if(i>=0){ proposalsRef.current.splice(i,1); renderGridPanel(); }
+  }
+
   const voiceTextBufRef=useRef('');
   const assistantSpeakingRef=useRef(false);
 
@@ -171,6 +317,93 @@ export default function App(){
   // track last user text robustly (server transcript OR local SR)
   const lastUserTextRef = useRef('');
 
+  // --- Speak-After-Confirm gate ---
+  const speakGateRef = useRef(true);             // true => require confirmation before any voice
+  const pendingSpeakRef = useRef(null);          // { kind, instructions }
+  const performingSpeakRef = useRef(false);      // we intentionally allowed speech
+
+  function ensureConfirmButton(){
+    if (document.getElementById('confirm-speak')) return;
+    const wrap = document.createElement('div');
+    wrap.id = 'confirm-wrap-fallback';
+    wrap.style.marginTop = '8px';
+    const btn = document.createElement('button');
+    btn.id = 'confirm-speak';
+    btn.textContent = '✅ Confirm & Speak';
+    btn.disabled = true;
+    Object.assign(btn.style, {
+      padding:'6px 10px', font:'inherit', borderRadius:'6px',
+      border:'1px solid #ddd', cursor:'not-allowed', background:'#f8f8f8'
+    });
+    btn.addEventListener('click', () => {
+      if (pendingSpeakRef.current && speakGateRef.current) performSpeak();
+    });
+    wrap.appendChild(btn);
+    const hint = document.createElement('span');
+    hint.id = 'confirm-hint';
+    hint.textContent = ' (Or hold SPACE and say “go ahead”)';
+    hint.style.marginLeft = '8px';
+    hint.style.color = '#666';
+    wrap.appendChild(hint);
+    // place near the audio element
+    const anchor = document.getElementById('assistant-audio') || document.body;
+    anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
+  }
+
+  function setConfirmUI(enabled, label){
+    ensureConfirmButton();
+    const btn = document.getElementById('confirm-speak');
+    const hint = document.getElementById('confirm-hint');
+    if (!btn) return;
+    btn.disabled = !enabled;
+    btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+    btn.style.background = enabled ? '#0b57d0' : '#f8f8f8';
+    btn.style.color = enabled ? '#fff' : '#444';
+    if (label) btn.textContent = label;
+    if (hint) hint.style.opacity = enabled ? 0.85 : 0.5;
+  }
+
+  function queueVoiceReply(kind='follow_up'){
+    if (gateOpenRef.current) return;
+    if (respPendingRef.current || currentResponseIdRef.current) return;
+    const ctx = [
+      'Context Summary:', summaryRef.current,
+      'Context State JSON:', JSON.stringify(stateRef.current),
+      'Use vocal prosody from the most recent user audio to infer tone.',
+      'If a change is needed, CALL update_state(add/remove).',
+      'Reply in English with one concise, targeted follow-up.'
+    ].join('\n');
+    pendingSpeakRef.current = { kind, instructions: ctx };
+    speakGateRef.current = true;
+    setConfirmUI(true, '✅ Confirm & Speak');
+  }
+
+  function performSpeak(){
+    if (!pendingSpeakRef.current || !speakGateRef.current) return;
+    const { instructions } = pendingSpeakRef.current;
+  
+    replyInFlightRef.current = true;
+    expectResponseRef.current = true;
+  
+    // This speak is intentional; allow it to pass the gate.
+    performingSpeakRef.current = true;
+    speakGateRef.current = false;
+    setConfirmUI(false, '✅ Confirm & Speak');
+  
+    // IMPORTANT: Realtime requires ['audio','text'] for speech
+    safeSend({
+      type:'response.create',
+      response:{ modalities:['audio','text'], instructions }
+    });
+  }
+  
+
+  function isVoiceConfirmation(text){
+    const t = (text||'').toLowerCase();
+    // Avoid accidental "yes"; require explicit phrasing
+    return /\b(go ahead|please proceed|proceed|you can speak|read it|say it|continue|please continue|ok speak|okay speak|go for it|sounds good|that works)\b/.test(t);
+  }
+
   // queue sends
   const outboxRef=useRef([]);
   function safeSend(obj){
@@ -199,6 +432,7 @@ export default function App(){
 
   function hasCi(arr,text){ const t=(text||'').trim().toLowerCase(); for(const s of arr) if((s||'').trim().toLowerCase()===t) return true; return false; }
   function applyStatePatch(patch){
+    if (gateOpenRef.current) return { added: [], removed: [] }; // block until defined
     const dst=stateRef.current; const added=[]; const removed=[];
     if(patch?.add){
       for(const bucket of Object.keys(patch.add)){ const arr=patch.add[bucket]||[]; dst[bucket]=dst[bucket]||[];
@@ -268,7 +502,29 @@ export default function App(){
     return Object.keys(remove).length?{ remove }:null;
   }
 
+  function inferCriteriaAndCellsFromUtterance(text){
+    const low = (text||'').toLowerCase();
+    const hits = [];
+    const L = [
+      { crit:'cost',      test:/\b(cost|price|budget|expensive|cheap)\b/,        weight: low.includes('cheap')||low.includes('lower') ? +20 : -30 },
+      { crit:'commute',   test:/\bcommute|minutes|min|train|subway|walk\b/,      weight: low.includes('short')||low.includes('<') ? +20 : -10 },
+      { crit:'space',     test:/\bspace|bedroom|br|sq ?ft|size\b/,               weight: +20 },
+      { crit:'quality',   test:/\bquality|nice|renovated|modern|new\b/,          weight: +15 },
+      { crit:'safety',    test:/\bsafe|crime|noisy|quiet\b/,                     weight: low.includes('quiet')||low.includes('safe') ? +15 : -15 },
+      { crit:'risk',      test:/\brisk|uncertain|unstable\b/,                    weight: -20 },
+      { crit:'convenience',test:/\bconvenient|near|close\b/,                     weight: +15 },
+    ];
+    for(const item of L){
+      if(item.test.test(low)){
+        hits.push({ criterion:item.crit, weight:item.weight, conf:0.6, rationale:`Heard: ${item.test}` });
+      }
+    }
+    return hits;
+  }
+
   async function addAndReconcileForUserTurn(lastUserText, mode='final'){
+    if (gateOpenRef.current) return; // no extractor proposals before consent
+
     const userOnly=transcriptRef.current.filter(t=>t.role==='user');
     let wantState={};
     try{
@@ -282,8 +538,27 @@ export default function App(){
       const toAdd=want.filter(v=>v && !hasCi(cur,v)); if(toAdd.length){ addPatch.add[b]=toAdd; anyAdd=true; }
     }
     if(anyAdd) applyStatePatch(addPatch);
+    
     const rmPatch=computeRemovePatchAgainst(wantState,lastUserText||'');
     if(rmPatch) applyStatePatch(rmPatch);
+
+    // ---- build grid proposals from extractor + heuristics ----
+    const props = [];
+    for(const opt of (wantState.options || [])){
+      if(!gridMDRef.current.options.has(opt)){
+        props.push({ type:'add_option', option: opt, source:'extractor' });
+      }
+    }
+    for(const h of inferCriteriaAndCellsFromUtterance(lastUserText||'')){
+      if(!gridMDRef.current.criteria.has(h.criterion)){
+        props.push({ type:'add_criterion', criterion: h.criterion, source:'heuristic' });
+      }
+      const [onlyOpt] = Array.from(gridMDRef.current.options.values());
+      if(onlyOpt){
+        props.push({ type:'set_cell', option: onlyOpt, criterion: h.criterion, weight: h.weight, conf: h.conf, rationale: h.rationale, source:'heuristic' });
+      }
+    }
+    enqueueProposals(props);
   }
 
   // --- Voice turns ---
@@ -296,8 +571,9 @@ export default function App(){
     });
   }
 
+  // (kept for completeness, not used by the gate flow)
   function sendVoiceReply(){
-    // NEW: don’t send if a reply is already pending/active
+    if (gateOpenRef.current) return;
     if (respPendingRef.current || currentResponseIdRef.current) return;
     if (replyInFlightRef.current) return;
     if (Date.now()-lastReplyAtRef.current < REPLY_COOLDOWN_MS) return;
@@ -314,7 +590,6 @@ export default function App(){
     safeSend({ type:'response.create', response:{ modalities:['audio','text'], instructions:ctx } });
   }
 
-  // IMPORTANT: correct way to answer a tool call in Realtime
   function sendToolOutput(callId,payload){
     safeSend({
       type: 'response.create',
@@ -323,6 +598,30 @@ export default function App(){
       }
     });
   }
+
+  function sendDefinitionGreeter() {
+    // Definition Gate: natural back-and-forth (no confirm gate while active).
+    performingSpeakRef.current = true;
+    speakGateRef.current = false;
+  
+    safeSend({
+      type: 'response.create',
+      response: {
+        modalities: ['audio','text'],
+        metadata: { kind: 'definition_greeter' },
+        instructions:
+          'Let’s set the decision definition together. Speak one short question at a time. ' +
+          'Start by asking, in English: "What decision are you making?" ' +
+          'As the user answers, call a tool named definition.greeter with partial fields you can infer ' +
+          '(title, scope, time_window, participants[], axes[]). ' +
+          'Do NOT mention JSON or field names to the user; keep the conversation natural. ' +
+          'After each answer, ask the next brief question (scope, time window, participants, key axes, etc.). ' +
+          'When you have enough to proceed, include status:"complete" in the tool output and give a short acknowledgement.'
+      }
+    });
+  }
+  
+  
 
   // --- optional local SR for UI ---
   function startSpeech(){
@@ -350,14 +649,21 @@ export default function App(){
     assistantSpeakingRef.current=false;
     replyInFlightRef.current=false;
     lastReplyAtRef.current=Date.now();
+    performingSpeakRef.current = false;     // our intentional speak done
+    speakGateRef.current = true;            // re-arm gate for next turn
 
-    // Use the strongest available last-user text
     const lastUserFromLog = [...transcriptRef.current].reverse().find(t=>t.role==='user')?.text || '';
     const lastUser = lastUserTextRef.current || lastUserFromLog;
 
     if(lastUser) await addAndReconcileForUserTurn(lastUser, 'final');
     await refreshFinalSummary();
     lastFinalizeAtRef.current=Date.now();
+
+    // Stage a reply (requires confirmation)
+    pendingSpeakRef.current = null;
+    if (!gateOpenRef.current) {
+      queueVoiceReply('follow_up'); // requires confirmation post-gate
+    }
   }
 
   // --- sanitize tool patch ---
@@ -385,8 +691,8 @@ export default function App(){
     switch(ev.type){
       case 'response.created': {
         const rid = ev?.response?.id || ev?.id || null;
-
-        // Cancel ONLY while user is holding PTT (talk-over prevention).
+      
+        // Never let the model talk while user is holding SPACE
         if (pttActiveRef.current) {
           if (rid) {
             log('[cancel auto response]', rid);
@@ -396,8 +702,14 @@ export default function App(){
           }
           return;
         }
-
-        // Accept server-owned replies after release (even if !expectResponseRef).
+      
+        // HARD GATE: only enforce cancel when Definition Gate is NOT active
+        if (!gateOpenRef.current && speakGateRef.current && !performingSpeakRef.current && rid) {
+          log('[gate] cancel unexpected response.created', rid);
+          safeSend({ type:'response.cancel', response_id: rid });
+          return;
+        }
+      
         currentResponseIdRef.current = rid || null;
         respPendingRef.current = true;
         expectResponseRef.current = false;
@@ -413,9 +725,8 @@ export default function App(){
         break;
       }
 
-      // Model's transcript of your audio -> make a user turn; also do an early (live) viz refresh
+      // Model's transcript of your audio -> make a user turn
       case 'conversation.item.input_audio_transcription.delta': {
-        // ignore partials
         break;
       }
       case 'conversation.item.input_audio_transcription.completed':
@@ -432,19 +743,18 @@ export default function App(){
           transcriptRef.current.push({ role:'user', text, ts:Date.now() });
           lastUserTextRef.current = text;
 
-          // EARLY extractor refresh (live) for faster viz
           addAndReconcileForUserTurn(text, 'live').catch(()=>{});
 
-          // Watchdog — if nothing is pending shortly after transcript, trigger a reply
-          setTimeout(() => {
-            if (!pttActiveRef.current &&
-                !respPendingRef.current &&
-                !currentResponseIdRef.current &&
-                !assistantSpeakingRef.current) {
-              log('[watchdog] triggering reply after transcript.completed');
-              sendVoiceReply();
+          // Voice confirmation intent
+          if (isVoiceConfirmation(text) && pendingSpeakRef.current && speakGateRef.current) {
+            log('[confirm] voice confirmation detected');
+            performSpeak();
+          } else {
+            // Stage a reply for confirmation if none is pending
+            if (!pendingSpeakRef.current && !gateOpenRef.current) {
+              queueVoiceReply('follow_up');
             }
-          }, 180);
+          }
         }
         break;
       }
@@ -476,24 +786,60 @@ export default function App(){
         break;
       }
       case 'response.function_call_arguments.done': {
-        const id = ev?.call_id || ev?.tool_call_id || ev?.id;
-        const entry = id && toolBufRef.current.get(id);
-        if (!entry) break;
-
+        const id   = ev?.call_id || ev?.tool_call_id || ev?.id;
+        if (!id) break;
+        const entry = toolBufRef.current.get(id);
         let args = {};
-        try { args = entry.args ? JSON.parse(entry.args) : {}; } catch {}
-        const clean = sanitizePatch(args);
-
-        if (entry.name === 'update_state') {
-          if (clean) applyStatePatch(clean);
-          sendToolOutput(id, { ok:true });
-        } else if (entry.name === 'persist_session') {
-          sendToolOutput(id, { ok:true, session_id:'dev-local' });
-        } else {
-          sendToolOutput(id, { ok:false, reason:'unsupported tool' });
-        }
-
+        try { args = entry?.args ? JSON.parse(entry.args) : {}; } catch {}
         toolBufRef.current.delete(id);
+        const name = entry?.name || ev?.name || ev?.tool_name || '';
+
+        if (name === 'definition.greeter') {
+          const status = (args.status || args.phase || '').toString().toLowerCase();
+          const pack   = args.pack || args.definition_pack || null;
+        
+          // Keep capturing partials as the conversation flows
+          if (pack) {
+            defPackRef.current = pack; // stash latest partial/complete pack
+          }
+        
+          // If the greeter marks completion (or we get a good pack), close the gate
+          if (status === 'complete' || args.complete === true || pack) {
+            consentRef.current  = true;
+            gateOpenRef.current = false;
+        
+            // Immediate, short acknowledgement (no confirmation required here)
+            performingSpeakRef.current = true;
+            speakGateRef.current = false;
+            safeSend({
+              type:'response.create',
+              response:{
+                modalities:['audio','text'],
+                instructions:'Great — I captured the decision definition. When you want me to continue, say "go ahead" or press Confirm.'
+              }
+            });
+        
+            // Next turns will be gated again
+            setTimeout(()=>{ speakGateRef.current = true; }, 0);
+        
+            sendToolOutput(id, { ok:true });
+            return;
+          }
+        
+          // Still collecting → stay in Definition Gate; the model will ask the next short question
+          sendToolOutput(id, { ok:true });
+          return;
+        }
+        
+        const clean = sanitizePatch(args);
+        if (name === 'update_state') {
+          if (clean) applyStatePatch(clean);
+          sendToolOutput(id, { ok: true });
+        } else if (name === 'persist_session') {
+          sendToolOutput(id, { ok: true, session_id: 'dev-local' });
+        } else {
+          sendToolOutput(id, { ok: false, reason: 'unsupported tool' });
+        }
         break;
       }
 
@@ -505,11 +851,10 @@ export default function App(){
 
         respPendingRef.current = false;
         currentResponseIdRef.current = null;
-        finalizeTurn();   // triggers /state(final) + /summary
+        finalizeTurn();   // triggers /state(final) + /summary and re-arms gate
         break;
       }
 
-      // Ignore these to avoid double-finalize; 'response.done' is source of truth
       case 'response.audio.done':
       case 'response.completed':
       case 'output_audio_buffer.stopped': {
@@ -584,11 +929,10 @@ export default function App(){
       // Unmute unless we're waiting for a server "cleared" after a cancel
       if (!unmuteWhenClearedRef.current) setAssistantMuted(false);
 
-      // If a reply already started (server auto), don't double-send
-      if (respPendingRef.current || currentResponseIdRef.current) return;
-
-      // now allow a single reply
-      sendVoiceReply();
+      // Do NOT auto-speak; stage a reply that requires confirmation
+      if (!gateOpenRef.current && !pendingSpeakRef.current) {
+        queueVoiceReply('follow_up');
+      }
     }
     function ensurePTTIndicator(){
       let el=document.getElementById('ptt-indicator');
@@ -602,6 +946,8 @@ export default function App(){
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     ensurePTTIndicator();
+    ensureConfirmButton();
+    setConfirmUI(false);
     return ()=>{ window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp); };
   }, []);
 
@@ -615,23 +961,33 @@ export default function App(){
       renderViz(document.getElementById('viz'), stateRef.current);
       conn.setHandler(handleServerEvent);
 
-      // mic detached by default
       try{ micSenderRef.current?.replaceTrack(null); }catch{}
 
-      // Configure: voice, transcription, and VAD (ON)
-      const arm=()=>{
-        if(onConnect.didConfig) return; onConnect.didConfig=true;
+      const arm = () => {
+        if (onConnect.didConfig) return;
+        onConnect.didConfig = true;
+      
         log('[session.update] voice+transcription+VAD');
         safeSend({
-          type:'session.update',
-          session:{
-            voice:'alloy',
-            input_audio_transcription:{ model:'whisper-1' },
-            turn_detection:{ type:'server_vad', threshold:0.6, silence_duration_ms:700 }
+          type: 'session.update',
+          session: {
+            voice: 'alloy',
+            input_audio_transcription: { model: 'whisper-1' },
+            turn_detection: { type: 'server_vad', threshold: 0.6, silence_duration_ms: 700 }
           }
         });
-        setStatus('Connected. Hold SPACE to talk.');
-        sendGreeting();
+      
+        // Keep mic detached so the greeter can't hear itself
+        try { micSenderRef.current?.replaceTrack(null); } catch {}
+        setAssistantMuted(false);
+      
+        // Open the gate for definition
+        gateOpenRef.current = true;
+        consentRef.current  = false;
+        defPackRef.current  = null;
+      
+        setStatus('Connected. Define the decision to begin.');
+        sendDefinitionGreeter();        // speak-once greeter (audio)
         flushOutbox();
       };
       if(conn.dc?.readyState==='open'){ arm(); } else { conn.dc?.addEventListener('open', arm); }
@@ -658,6 +1014,10 @@ export default function App(){
     try{ micSenderRef.current?.replaceTrack(micTrackRef.current||null); }catch{}
     const ind=document.getElementById('ptt-indicator'); if(ind) ind.textContent='Press and hold SPACE to talk';
     setAssistantMuted(false);
+    // reset gate/pending
+    speakGateRef.current = true;
+    pendingSpeakRef.current = null;
+    setConfirmUI(false);
   }
 
   useEffect(()=>{
@@ -677,3 +1037,4 @@ export default function App(){
 
   return React.createElement(React.Fragment,null);
 }
+
