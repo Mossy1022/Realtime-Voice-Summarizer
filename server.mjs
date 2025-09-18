@@ -16,16 +16,17 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
 async function readJson(req) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     let data = '';
     req.on('data', c => (data += c));
     req.on('end', () => {
       try { resolve(data ? JSON.parse(data) : {}); }
-      catch (e) { reject(e); }
+      catch { resolve({}); }
     });
-    req.on('error', reject);
+    req.on('error', () => resolve({}));
   });
 }
+
 
 /**
  * Create an ephemeral Realtime session for VOICE (WebRTC).
@@ -47,58 +48,78 @@ async function createEphemeralSession() {
       'You may also call persist_session to save a durable snapshot; you will receive a session_id in the tool output.',
       'Do NOT begin a new response unless the client sends response.create.',
       'After any tool use, continue speaking naturally and ask one targeted follow-up that best fills a gap.'
-    ].join(' '),
-    tools: [
-      {
-        type: 'function',
-        name: 'update_state',
-        description: 'Add or remove short items in the live Perspective State.',
-        parameters: {
-          type: 'object',
-          properties: {
-            add: {
-              type: 'object',
-              properties: {
-                goals: { type: 'array', items: { type: 'string' } },
-                facts: { type: 'array', items: { type: 'string' } },
-                questions: { type: 'array', items: { type: 'string' } },
-                options: { type: 'array', items: { type: 'string' } },
-                decisions: { type: 'array', items: { type: 'string' } },
-                next_steps: { type: 'array', items: { type: 'string' } },
-                risks: { type: 'array', items: { type: 'string' } }
-              },
-              additionalProperties: false
-            },
-            remove: {
-              type: 'object',
-              properties: {
-                goals: { type: 'array', items: { type: 'string' } },
-                facts: { type: 'array', items: { type: 'string' } },
-                questions: { type: 'array', items: { type: 'string' } },
-                options: { type: 'array', items: { type: 'string' } },
-                decisions: { type: 'array', items: { type: 'string' } },
-                next_steps: { type: 'array', items: { type: 'string' } },
-                risks: { type: 'array', items: { type: 'string' } }
-              },
-              additionalProperties: false
-            }
-          },
-          additionalProperties: false
-        }
-      },
-      {
-        type: 'function',
-        name: 'persist_session',
-        description: 'Ask the host app to persist the current summary and state; returns a session_id you can reference later.',
-        parameters: {
-          type: 'object',
-          properties: {
-            note: { type: 'string', description: 'Optional note or title for this save point.' }
-          },
-          additionalProperties: false
-        }
-      }
-    ]
+    ].join(' ')
+    // tools: [
+    // {
+    //     type: 'function',
+    //     name: 'definition_greeter',
+    //     description: 'Collect decision definition pieces (title, scope, time window, participants, axes).',
+    //     parameters: {
+    //       type: 'object',
+    //       properties: {
+    //         status: { type:'string', enum:['collecting','complete'] },
+    //         pack: {
+    //           type:'object',
+    //           properties:{
+    //             title:{type:'string'}, scope:{type:'string'}, time_window:{type:'string'},
+    //             participants:{type:'array', items:{type:'string'}},
+    //             axes:{type:'array', items:{type:'string'}}
+    //           }
+    //         }
+    //       },
+    //       additionalProperties: false
+    //     }
+    //   },
+    //   {
+    //     type: 'function',
+    //     name: 'update_state',
+    //     description: 'Add or remove short items in the live Perspective State.',
+    //     parameters: {
+    //       type: 'object',
+    //       properties: {
+    //         add: {
+    //           type: 'object',
+    //           properties: {
+    //             goals: { type: 'array', items: { type: 'string' } },
+    //             facts: { type: 'array', items: { type: 'string' } },
+    //             questions: { type: 'array', items: { type: 'string' } },
+    //             options: { type: 'array', items: { type: 'string' } },
+    //             decisions: { type: 'array', items: { type: 'string' } },
+    //             next_steps: { type: 'array', items: { type: 'string' } },
+    //             risks: { type: 'array', items: { type: 'string' } }
+    //           },
+    //           additionalProperties: false
+    //         },
+    //         remove: {
+    //           type: 'object',
+    //           properties: {
+    //             goals: { type: 'array', items: { type: 'string' } },
+    //             facts: { type: 'array', items: { type: 'string' } },
+    //             questions: { type: 'array', items: { type: 'string' } },
+    //             options: { type: 'array', items: { type: 'string' } },
+    //             decisions: { type: 'array', items: { type: 'string' } },
+    //             next_steps: { type: 'array', items: { type: 'string' } },
+    //             risks: { type: 'array', items: { type: 'string' } }
+    //           },
+    //           additionalProperties: false
+    //         }
+    //       },
+    //       additionalProperties: false
+    //     }
+    //   },
+    //   {
+    //     type: 'function',
+    //     name: 'persist_session',
+    //     description: 'Ask the host app to persist the current summary and state; returns a session_id you can reference later.',
+    //     parameters: {
+    //       type: 'object',
+    //       properties: {
+    //         note: { type: 'string', description: 'Optional note or title for this save point.' }
+    //       },
+    //       additionalProperties: false
+    //     }
+    //   }
+    // ]
   };
 
   const res = await fetch('https://api.openai.com/v1/realtime/sessions', {
@@ -218,6 +239,41 @@ async function extractState(payload) {
   return { state };
 }
 
+function proposePrompt({ transcript = [], focus = '', mode = 'final' }) {
+  const lines = transcript.slice(-30)
+    .map(({ role, text }) => `${role.toUpperCase()}: ${text.replace(/\s+/g,' ').trim()}`)
+    .join('\n');
+  return [
+    'You are Reason-Scout. From the conversation and focus, propose a SMALL batch of actions.',
+    'Return a JSON object with a single key "proposals": an array of 3..8 items.',
+    'Each item is one of:',
+    '- {"type":"add_option","option":"string"}',
+    '- {"type":"add_criterion","criterion":"string"}',
+    '- {"type":"set_cell","option":"string","criterion":"string","weight":-100..100,"conf":0..1,"rationale":"short","anchors":["LifeArea","..."]}',
+    'LifeArea ∈ {Work, Health, Finances, Relationships, Identity, Logistics}.',
+    'No commentary outside the JSON object.',
+    '',
+    `Focus: ${focus || '(none)'}\nTranscript:\n${lines || '(none)'}`
+  ].join('\n');
+}
+
+function proposeLocalFallback({ transcript = [], focus = '' } = {}) {
+  const text = (transcript || []).map(t => (t?.text || '')).join(' ').toLowerCase();
+
+  const opts = new Set();
+  if (/st\.?\s*pete|st\s*petersburg/.test(text)) opts.add('Move to St. Pete');
+  if (/\bbrandon\b/.test(text))                 opts.add('Stay in Brandon');
+
+  const props = Array.from(opts).map(option => ({ type:'add_option', option }));
+
+  // A few sensible criteria for housing/location decisions
+  ['cost','commute','community','noise','family distance'].slice(0, 3)
+    .forEach(c => props.push({ type:'add_criterion', criterion:c }));
+
+  return { proposals: props.slice(0, 8) };
+}
+
+
 /** ---------- static files ---------- */
 function serveStatic(req, res) {
   const requestUrl = new URL(req.url, `http://${req.headers.host}`);
@@ -269,6 +325,73 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(out));
       return;
     }
+
+    if (pathname === '/propose') {
+      cors();
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        }); res.end(); return;
+      }
+      if (req.method !== 'POST') { res.writeHead(405); res.end('Method Not Allowed'); return; }
+    
+      let proposals = [];
+      try {
+        const body = await readJson(req);
+        const prompt = proposePrompt(body || {});
+    
+        if (OPENAI_API_KEY) {
+          // Primary call (no text.format)
+          let r = await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: 'gpt-4o-mini', input: prompt })
+          }).catch(err => ({ ok:false, _err: err }));
+    
+          // Fallback
+          if (!r?.ok) {
+            try { console.error('[propose primary error]', r?._err ? r._err : (await r.text())); } catch {}
+            r = await fetch('https://api.openai.com/v1/responses', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: 'gpt-4o-mini', input: prompt })
+            }).catch(err => ({ ok:false, _err: err }));
+          }
+    
+          if (r?.ok) {
+            const j = await r.json().catch(()=> ({}));
+            let raw = j?.output_text
+                    || j?.output?.[0]?.content?.[0]?.text
+                    || j?.content?.[0]?.text
+                    || (typeof j === 'string' ? j : '');
+            if (typeof raw !== 'string') raw = '';
+    
+            try {
+              const obj = raw ? JSON.parse(raw) : null;
+              if (obj && Array.isArray(obj.proposals)) proposals = obj.proposals;
+              else if (Array.isArray(obj)) proposals = obj;
+            } catch {
+              const i = raw.indexOf('['), k = raw.lastIndexOf(']');
+              if (i >= 0 && k > i) { try { proposals = JSON.parse(raw.slice(i, k+1)); } catch {} }
+            }
+          }
+        }
+    
+        if (!Array.isArray(proposals) || proposals.length === 0) {
+          proposals = proposeLocalFallback(body).proposals;
+        }
+      } catch (e) {
+        console.error('[propose fatal]', e?.stack || e);
+        proposals = [];
+      }
+    
+      proposals = proposals.slice(0, 12);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ proposals }));
+      return;
+    }
+    
 
     if (pathname === '/state') {
       cors();

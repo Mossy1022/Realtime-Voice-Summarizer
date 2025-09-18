@@ -115,6 +115,23 @@ function renderViz(el, state){
 function escapeHtml(s){ return (s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 function genId(prefix){ const n=Math.random().toString(36).slice(2,7); return `${prefix}_${Date.now().toString(36)}${n}`; }
 
+const LIFE_AREAS = ['Work','Health','Finances','Relationships','Identity','Logistics'];
+
+function renderAnchorChips(selected = []) {
+  const sel = new Set((selected || []).map(s => (s || '').trim()));
+  return LIFE_AREAS.map(name => {
+    const isSel = sel.has(name);
+    const bg = isSel ? '#0b57d0' : '#f7f7f7';
+    const fg = isSel ? '#fff' : '#222';
+    const br = isSel ? '#0b57d0' : '#ddd';
+    return `<button class="gp-anchor${isSel ? ' sel' : ''}" data-anchor="${escapeHtml(name)}"
+              style="display:inline-block;margin:4px 6px 0 0;padding:4px 8px;border-radius:999px;
+                     border:1px solid ${br};background:${bg};color:${fg};font-size:.85rem;cursor:pointer">
+              ${escapeHtml(name)}
+            </button>`;
+  }).join('');
+}
+
 // --- tokens ---
 const STOP=new Set('a,an,the,of,to,in,on,for,with,from,into,by,at,as,and,or,not,no,just,only,that,this,those,these,over,under,near,about,around,after,before,than,then,there,is,are,be,been,being,do,does,did,can,could,should,would,will,may,might,have,has,had,i,we,you,they,he,she,it,my,our,your,their,me,us'.split(','));
 function tokens(s){ return (s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w=>w && !STOP.has(w)); }
@@ -135,6 +152,34 @@ export default function App(){
   const summaryRef=useRef('Say something and then press SPACE…');
   const stateRef=useRef({goals:[],facts:[],questions:[],options:[],decisions:[],next_steps:[],risks:[]});
   const idMapRef=useRef(new Map());
+  const evidenceRegRef = useRef(new Map()); // id -> EvidenceCard
+  const claimRegRef    = useRef(new Map()); // id -> ClaimTemplate
+  const usageRegRef    = useRef(new Map()); // usage_id -> ClaimUsage
+
+  const coverageRef = useRef({ possible:0, anchored:0, reviewed:0, fresh:0 });
+
+function updateCoverageCounters(){
+  const cells = Array.from(gridMDRef.current.cells.values());
+  const possible = cells.length;
+  const anchored = cells.filter(c => Array.isArray(c.anchors) && c.anchors.length > 0).length;
+  const reviewed = anchored; // MVP: treat accepted as reviewed
+  const fresh    = anchored; // MVP: treat accepted this session as fresh
+
+  coverageRef.current = { possible, anchored, reviewed, fresh };
+  const pct = anchored ? Math.round(100 * reviewed / anchored) : 0;
+
+  const chip = document.getElementById('coverage');
+  if (chip) chip.textContent = `anchors ${anchored}/${possible} • reviewed ${pct}% • fresh ${fresh}`;
+}
+
+
+
+  function upsertEvidence(card){ evidenceRegRef.current.set(card.id, { ...card, updated_at: new Date().toISOString() }); styleEvidenceEverywhere(card.id); }
+  function upsertClaimTemplate(t){ claimRegRef.current.set(t.id, { ...t, updated_at: new Date().toISOString() }); openPropagationPanel(t.id); }
+  function styleEvidenceEverywhere(evId){
+    // MVP: no drawing call needed yet; when cells render rails with inner-line, consult evidence cred.
+  }
+
 
   // Definition Gate
   const gateOpenRef = useRef(false);
@@ -154,7 +199,17 @@ export default function App(){
 
   function enqueueProposals(list){
     const seen = new Set(proposalsRef.current.map(p=>pKey(p)));
+    const grid = gridMDRef.current;
+
     for(const p of list){
+      // Skip duplicates against the accepted model
+      if (p.type === 'add_option' && grid.options.has((p.option||'').trim().toLowerCase())) continue;
+      if (p.type === 'add_criterion' && grid.criteria.has((p.criterion||'').trim().toLowerCase())) continue;
+      if (p.type === 'set_cell') {
+        const key = kCell(p.option, p.criterion);
+        if (grid.cells.has(key)) continue; // already accepted
+      }
+
       const key = pKey(p);
       if(!seen.has(key)){ proposalsRef.current.push({ id: genId('gp'), ts: Date.now(), source: p.source||'heuristic', ...p }); seen.add(key); }
     }
@@ -164,42 +219,113 @@ export default function App(){
   function renderGridPanel(){
     const el = document.getElementById('grid-proposals');
     if(!el) return;
-    const rows = proposalsRef.current.map(p=>{
+  
+    // Normalize proposals: ensure arrays exist
+    for (const p of proposalsRef.current) {
+      if (p.type === 'set_cell') {
+        if (!Array.isArray(p.anchors)) p.anchors = [];
+      }
+    }
+  
+    const rows = proposalsRef.current.map(p => {
       let desc = '';
-      if(p.type==='add_option') desc = `Add option: <b>${escapeHtml(p.option)}</b>`;
-      else if(p.type==='add_criterion') desc = `Add criterion: <b>${escapeHtml(p.criterion)}</b>`;
-      else if(p.type==='set_cell') desc = `Set <b>${escapeHtml(p.option)}</b> × <b>${escapeHtml(p.criterion)}</b> → weight ${p.weight} (conf ${Math.round((p.conf||0)*100)}%)`;
+      if (p.type === 'add_option') {
+        desc = `Add option: <b>${escapeHtml(p.option)}</b>`;
+      } else if (p.type === 'add_criterion') {
+        desc = `Add criterion: <b>${escapeHtml(p.criterion)}</b>`;
+      } else if (p.type === 'set_cell') {
+        desc = `Set <b>${escapeHtml(p.option)}</b> × <b>${escapeHtml(p.criterion)}</b> → weight ${p.weight} (conf ${Math.round((p.conf||0)*100)}%)`;
+      }
+  
+      // Anchors UI only for set_cell
+      const anchorsBlock = (p.type === 'set_cell')
+        ? `
+          <div class="small" style="color:#666;margin-top:6px;margin-bottom:2px;">Anchors (pick up to 2):</div>
+          <div class="gp-anchors" data-for="${p.id}">
+            ${renderAnchorChips(p.anchors)}
+          </div>`
+        : '';
+  
+      const rationale = p.rationale ? ` — <i>${escapeHtml(p.rationale)}</i>` : '';
+  
       return `
         <div class="gp-row" data-id="${p.id}" style="border:1px solid #eee;border-radius:8px;padding:8px;margin:6px 0;">
-          <div class="small" style="color:#888;margin-bottom:2px;">${new Date(p.ts).toLocaleTimeString()} • ${p.source}</div>
-          <div>${desc}${p.rationale ? ` — <i>${escapeHtml(p.rationale)}</i>` : ''}</div>
-          <div style="margin-top:6px;">
+          <div class="small" style="color:#888;margin-bottom:2px;">
+            ${new Date(p.ts).toLocaleTimeString()} • ${escapeHtml(p.source||'')}
+          </div>
+          <div>${desc}${rationale}</div>
+          ${anchorsBlock}
+          <div style="margin-top:8px;">
             <button class="gp-accept">Accept</button>
             <button class="gp-edit">Edit</button>
             <button class="gp-discard">Discard</button>
           </div>
         </div>`;
     }).join('') || '<div class="small" style="color:#666;">No proposals yet.</div>';
-
+  
     const summary = `
       <div class="small" style="color:#666;margin-bottom:6px;">
-        Structure: ${gridMDRef.current.options.size} option(s), ${gridMDRef.current.criteria.size} criterion/criteria, ${gridMDRef.current.cells.size} cell(s)
+        Structure: ${gridMDRef.current.options.size} option(s),
+        ${gridMDRef.current.criteria.size} criterion/criteria,
+        ${gridMDRef.current.cells.size} cell(s)
       </div>`;
-
+  
     el.innerHTML = summary + rows;
-
-    // event delegation
-    el.onclick = (e)=>{
+  
+    // Event delegation (accept/edit/discard + anchor toggles)
+    el.onclick = (e) => {
       const row = e.target.closest('.gp-row'); if(!row) return;
       const id  = row.dataset.id;
       const p   = proposalsRef.current.find(x=>x.id===id);
       if(!p) return;
-
-      if(e.target.classList.contains('gp-accept')) acceptProposal(p.id);
-      if(e.target.classList.contains('gp-edit'))   editProposal(p.id);
-      if(e.target.classList.contains('gp-discard')) discardProposal(p.id);
+  
+      // Toggle anchor chip (limit 2)
+      if (e.target.classList.contains('gp-anchor')) {
+        if (p.type !== 'set_cell') return;
+  
+        const btn = e.target;
+        const name = btn.dataset.anchor;
+        if (!name) return;
+  
+        p.anchors = Array.isArray(p.anchors) ? p.anchors : [];
+        const has = p.anchors.includes(name);
+  
+        if (has) {
+          // deselect
+          p.anchors = p.anchors.filter(a => a !== name);
+          btn.classList.remove('sel');
+          btn.style.background = '#f7f7f7';
+          btn.style.color = '#222';
+          btn.style.borderColor = '#ddd';
+        } else {
+          // enforce at most 2
+          if (p.anchors.length >= 2) {
+            // remove the first selected in the row
+            const firstSel = row.querySelector('.gp-anchor.sel');
+            if (firstSel) {
+              const firstName = firstSel.dataset.anchor;
+              p.anchors = p.anchors.filter(a => a !== firstName);
+              firstSel.classList.remove('sel');
+              firstSel.style.background = '#f7f7f7';
+              firstSel.style.color = '#222';
+              firstSel.style.borderColor = '#ddd';
+            }
+          }
+          p.anchors.push(name);
+          btn.classList.add('sel');
+          btn.style.background = '#0b57d0';
+          btn.style.color = '#fff';
+          btn.style.borderColor = '#0b57d0';
+        }
+        return; // don’t fall through to buttons
+      }
+  
+      if (e.target.classList.contains('gp-accept'))  acceptProposal(p.id);
+      if (e.target.classList.contains('gp-edit'))    editProposal(p.id);
+      if (e.target.classList.contains('gp-discard')) discardProposal(p.id);
     };
   }
+  
 
   function showDefinitionGateUI(draftText) {
     let wrap = document.getElementById('defgate');
@@ -232,6 +358,12 @@ export default function App(){
         gateOpenRef.current = false;
         wrap.remove();
         console.log('[defgate] accepted pack:', defPackRef.current);
+        const ft = document.getElementById('focus-title');
+        if (ft) {
+          const pack = defPackRef.current;
+          const label = typeof pack==='string' ? pack : (pack?.title || '(set)');
+          ft.textContent = `Focus: ${label}`;
+        }
       } catch {
         alert('Invalid JSON. Paste plain text or valid JSON object.');
       }
@@ -243,8 +375,8 @@ export default function App(){
     if(idx<0) return;
     const p = proposalsRef.current[idx];
     const grid = gridMDRef.current;
-
-    if(p.type==='add_option'){
+  
+    if (p.type === 'add_option') {
       grid.options.add(p.option);
       const opt = (p.option||'').trim();
       if(opt && !stateRef.current.options?.some?.(s => s.trim().toLowerCase()===opt.toLowerCase())){
@@ -252,17 +384,38 @@ export default function App(){
         stateRef.current.options.push(opt);
         renderViz(document.getElementById('viz'), stateRef.current);
       }
-    }else if(p.type==='add_criterion'){
+    } else if (p.type === 'add_criterion') {
       grid.criteria.add(p.criterion);
-    }else if(p.type==='set_cell'){
-      if(p.option) grid.options.add(p.option);
+    } else if (p.type === 'set_cell') {
+      if(p.option)   grid.options.add(p.option);
       if(p.criterion) grid.criteria.add(p.criterion);
-      grid.cells.set(kCell(p.option,p.criterion), { weight: p.weight|0, conf: Math.max(0,Math.min(1,p.conf||0)), rationale: p.rationale||'' });
+  
+      // Finalize anchors: prefer selected chips in the row; fallback to p.anchors
+      const row = document.querySelector(`.gp-row[data-id="${id}"]`);
+      let selected = [];
+      if (row) {
+        selected = Array.from(row.querySelectorAll('.gp-anchor.sel')).map(b => b.dataset.anchor).filter(Boolean);
+      }
+      const anchors = (selected.length ? selected : (Array.isArray(p.anchors) ? p.anchors : [])).slice(0,2);
+  
+      grid.cells.set(
+        kCell(p.option, p.criterion),
+        {
+          weight: p.weight|0,
+          conf: Math.max(0, Math.min(1, p.conf||0)),
+          rationale: p.rationale || '',
+          anchors
+        }
+      );
+  
+      // Update coverage counters whenever we write a cell
+      if (typeof updateCoverageCounters === 'function') updateCoverageCounters();
     }
-
+  
     proposalsRef.current.splice(idx,1);
     renderGridPanel();
   }
+  
 
   function editProposal(id){
     const p = proposalsRef.current.find(x=>x.id===id); if(!p) return;
@@ -302,6 +455,14 @@ export default function App(){
   const lastFinalizeAtRef=useRef(0);
   const expectResponseRef=useRef(false);
   const currentResponseIdRef=useRef(null);
+
+  const turnCommittedRef = useRef(false);
+  const manualCommitRef = useRef(false);   // only true when we commit on keyup
+  const pttStartAtRef     = useRef(0);       // when SPACE was pressed
+  const MIN_PTT_MS        = 150;             // avoid 0ms commits
+
+  const commitWindowUntilRef = useRef(0);
+  const COMMIT_WINDOW_MS = 2500; // accept transcript for 2.5s after commit
 
   // reply single-flight
   const replyInFlightRef=useRef(false);
@@ -420,6 +581,33 @@ export default function App(){
       try{ dc.send(p); log('[dc-> flush]', JSON.parse(p)?.type); }catch{ break; }
     }
   }
+
+  // ---- sendDefinitionGreeter (greeting on connect) ----
+function sendDefinitionGreeter() {
+  // Definition Gate: allow one intentional speak
+  performingSpeakRef.current = true;
+  speakGateRef.current = false;
+
+  // ✅ Tell the router that a reply is expected (don’t cancel it)
+  expectResponseRef.current = true;
+
+  safeSend({
+    type: 'response.create',
+    response: {
+      modalities: ['audio','text'],
+      metadata: { kind: 'definition_greeter' },
+      instructions:
+        'Let’s set the decision definition together. Speak one short question at a time. ' +
+        'Start by asking, in English: "What decision are you making?" ' +
+        'As the user answers, call a tool named definition_greeter with partial fields you can infer ' +
+        '(title, scope, time_window, participants[], axes[]). ' +
+        'Do NOT mention JSON or field names to the user; keep the conversation natural. ' +
+        'After each answer, ask the next brief question (scope, time window, participants, key axes, etc.). ' +
+        'When you have enough to proceed, include status:"complete" in the tool output and give a short acknowledgement.'
+    }
+  });
+}
+
 
   // --- local nudge for viz (only used on PTT release) ---
   function localAddOnlyFromUser(text){
@@ -590,39 +778,20 @@ export default function App(){
     safeSend({ type:'response.create', response:{ modalities:['audio','text'], instructions:ctx } });
   }
 
-  function sendToolOutput(callId,payload){
-    safeSend({
-      type: 'response.create',
-      response: {
-        tool_outputs: [{ tool_call_id: callId, output: JSON.stringify(payload) }]
-      }
-    });
-  }
-
-  function sendDefinitionGreeter() {
-    // Definition Gate: natural back-and-forth (no confirm gate while active).
-    performingSpeakRef.current = true;
-    speakGateRef.current = false;
+  function sendToolOutput(callId, payload){
+    // The model will often continue the SAME response after tool outputs.
+    // Let that continuation through the gate.
+    expectResponseRef.current = true;
   
     safeSend({
       type: 'response.create',
-      response: {
-        modalities: ['audio','text'],
-        metadata: { kind: 'definition_greeter' },
-        instructions:
-          'Let’s set the decision definition together. Speak one short question at a time. ' +
-          'Start by asking, in English: "What decision are you making?" ' +
-          'As the user answers, call a tool named definition.greeter with partial fields you can infer ' +
-          '(title, scope, time_window, participants[], axes[]). ' +
-          'Do NOT mention JSON or field names to the user; keep the conversation natural. ' +
-          'After each answer, ask the next brief question (scope, time window, participants, key axes, etc.). ' +
-          'When you have enough to proceed, include status:"complete" in the tool output and give a short acknowledgement.'
-      }
+      // NOTE: tool_outputs is a top-level field (not inside "response")
+      tool_outputs: [
+        { tool_call_id: callId, output: JSON.stringify(payload) }
+      ]
     });
   }
-  
-  
-
+   
   // --- optional local SR for UI ---
   function startSpeech(){
     const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -642,10 +811,7 @@ export default function App(){
 
   // --- finalize once ---
   async function finalizeTurn(){
-    if(voiceTextBufRef.current.trim()){
-      transcriptRef.current.push({ role:'assistant', text:voiceTextBufRef.current.trim(), ts:Date.now() });
-      voiceTextBufRef.current='';
-    }
+
     assistantSpeakingRef.current=false;
     replyInFlightRef.current=false;
     lastReplyAtRef.current=Date.now();
@@ -661,11 +827,64 @@ export default function App(){
 
     // Stage a reply (requires confirmation)
     pendingSpeakRef.current = null;
-    if (!gateOpenRef.current) {
+    if (!gateOpenRef.current && speakPolicyRef.current === 'confirm') {
       queueVoiceReply('follow_up'); // requires confirmation post-gate
     }
   }
 
+  async function onUserTextSend(text){
+    // 1) chat bubble
+    addMessage('user', text);
+    transcriptRef.current.push({ role:'user', text, ts:Date.now() });
+    lastUserTextRef.current = text;
+  
+    // 2) helpers in parallel
+    try {
+      const [sum, st, prop] = await Promise.all([
+        postJSON('/summary', { transcript: transcriptRef.current.slice(-30), mode:'live' }),
+        postJSON('/state',   { transcript: transcriptRef.current.filter(t=>t.role==='user').slice(-30), mode:'live' }),
+        postJSON('/propose', { transcript: transcriptRef.current.slice(-30), focus: defPackRef.current||'', mode:'live' })
+      ]);
+      if (sum?.summary){ setSummary(sum.summary); summaryRef.current = sum.summary; }
+      if (st?.state) { applyStatePatch({ add: st.state }); } // safe no-op if dup
+      if (prop?.proposals?.length) enqueueProposals(prop.proposals.map(p=>({ ...p, source:'scout' })));
+    } catch(e){ log('[turn helpers err]', e?.message||e); }
+  
+    // 3) single reply path via Realtime (TEXT path only creates an item)
+    const policy = speakPolicyRef.current; // 'confirm' | 'auto' | 'text'
+    const mods = policy==='auto' ? ['text','audio'] : ['text'];
+
+    safeSend({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',            // <<< REQUIRED
+        role: 'user',
+        content: [{ type:'input_text', text }]
+      }
+    });
+
+    expectResponseRef.current = true;
+    safeSend({ type:'response.create', response:{ modalities:mods, instructions: buildSystemCtx() } });
+
+  }
+  function buildSystemCtx(){
+    const grid = gridMDRef.current;
+     const gridSnapshot = {
+       options: Array.from(grid.options),
+       criteria: Array.from(grid.criteria),
+       cells: Array.from(grid.cells.entries())
+               .map(([k,v]) => ({ key:k, weight:v.weight, conf:v.conf, anchors:v.anchors||[] }))
+     };
+    return [
+      'You are the Objective Accomplisher Coach. Use one concise reply.',
+      'Context Summary:', summaryRef.current,
+      'State JSON:', JSON.stringify(stateRef.current).slice(0,2000),
+      'Grid Snapshot:', JSON.stringify(gridSnapshot).slice(0,2000),
+      'If a small add/remove helps, CALL update_state tool; keep reply short.',
+      'Your job is not to decide for me but to uncover the top missing facts, goals, constraints, and options to populate the objective map.'
+    ].join('\n');
+  }
+  
   // --- sanitize tool patch ---
   function sanitizePatch(p){
     if (!p || typeof p !== 'object') return null;
@@ -685,15 +904,23 @@ export default function App(){
   }
 
   // --- router ---
-  function handleServerEvent(ev){
+  async function handleServerEvent(ev){
     if(!ev || typeof ev!=='object') return;
-
+  
     switch(ev.type){
+  
       case 'response.created': {
         const rid = ev?.response?.id || ev?.id || null;
-      
-        // Never let the model talk while user is holding SPACE
-        if (pttActiveRef.current) {
+  
+        // Block unsolicited replies unless we asked for one
+        if (!expectResponseRef.current && rid) {
+          log('[gate] cancel unsolicited response', rid);
+          safeSend({ type:'response.cancel', response_id: rid });
+          return;
+        }
+  
+        // If the user is still talking (pre-commit), cancel any auto reply
+        if (pttActiveRef.current || !turnCommittedRef.current) {
           if (rid) {
             log('[cancel auto response]', rid);
             setAssistantMuted(true);
@@ -702,64 +929,119 @@ export default function App(){
           }
           return;
         }
-      
-        // HARD GATE: only enforce cancel when Definition Gate is NOT active
-        if (!gateOpenRef.current && speakGateRef.current && !performingSpeakRef.current && rid) {
+  
+        // Gate: only allow intended replies
+        if (!gateOpenRef.current && speakGateRef.current && !performingSpeakRef.current && !expectResponseRef.current && rid) {
           log('[gate] cancel unexpected response.created', rid);
           safeSend({ type:'response.cancel', response_id: rid });
           return;
         }
-      
+  
         currentResponseIdRef.current = rid || null;
         respPendingRef.current = true;
         expectResponseRef.current = false;
+        voiceTextBufRef.current = '';
+        currentAssistantMsgIdRef.current = null;
         break;
       }
-
-      // Assistant text stream (buffer) — only for our active response
+  
+      // Assistant streaming text (we reuse this for audio transcript deltas too)
+      case 'response.text.delta':
       case 'response.output_text.delta':
       case 'response.audio_transcript.delta': {
         const rid = ev?.response_id || ev?.response?.id || null;
-        if (currentResponseIdRef.current && rid && rid !== currentResponseIdRef.current) break;
-        voiceTextBufRef.current += ev?.delta || '';
+        if (!rid || rid !== currentResponseIdRef.current) break;
+        voiceTextBufRef.current = (voiceTextBufRef.current || '') + (ev?.delta || '');
+        upsertAssistantStream();
         break;
       }
-
-      // Model's transcript of your audio -> make a user turn
-      case 'conversation.item.input_audio_transcription.delta': {
-        break;
-      }
-      case 'conversation.item.input_audio_transcription.completed':
-      case 'input_audio_transcription.completed': {
-        const t =
-          (ev.transcript || ev.text) ??
-          (ev.item && (ev.item.transcript || ev.item.text)) ??
-          (Array.isArray(ev.item?.content)
-            ? ev.item.content.map(c => c?.transcript || c?.text).filter(Boolean).join(' ')
-            : '');
-        const text=(t||'').trim();
-        if(text){
-          log('[input transcript]', text);
-          transcriptRef.current.push({ role:'user', text, ts:Date.now() });
-          lastUserTextRef.current = text;
-
-          addAndReconcileForUserTurn(text, 'live').catch(()=>{});
-
-          // Voice confirmation intent
-          if (isVoiceConfirmation(text) && pendingSpeakRef.current && speakGateRef.current) {
-            log('[confirm] voice confirmation detected');
-            performSpeak();
-          } else {
-            // Stage a reply for confirmation if none is pending
-            if (!pendingSpeakRef.current && !gateOpenRef.current) {
-              queueVoiceReply('follow_up');
-            }
-          }
+  
+      case 'response.text.done':
+      case 'response.output_text.done':
+      case 'response.completed': {
+        const rid = ev?.response_id || ev?.response?.id || null;
+        if (!rid || rid !== currentResponseIdRef.current) break;
+  
+        const text = (voiceTextBufRef.current || '').trim();
+        if (currentAssistantMsgIdRef.current) finalizeAssistantStream();
+        else if (text) addMessage('assistant', text);
+        if (text) transcriptRef.current.push({ role:'assistant', text, ts:Date.now() });
+        voiceTextBufRef.current = '';
+  
+        if (respPendingRef.current) {
+          respPendingRef.current = false;
+          currentResponseIdRef.current = null;
+          finalizeTurn();
         }
         break;
       }
+  
+      // We ignore deltas for our user-voice turn; we only act on the "completed" event below
+      case 'conversation.item.input_audio_transcription.delta': {
+        break;
+      }
+  
+      // SERVER transcript completed (only accept if it's the one from our keyup-commit window)
+      case 'conversation.item.input_audio_transcription.completed':
+      case 'input_audio_transcription.completed': {
+        const raw = (ev?.transcript || ev?.text) || (ev?.item?.transcript) || '';
+        const text = (Array.isArray(raw) ? raw.join(' ') : raw || '').trim();
+        if (!text) break;
+  
+        // Accept only if: NOT holding + we marked this as our manual commit + still within window
+        const inWindow = Date.now() <= (commitWindowUntilRef.current || 0);
+        if (pttActiveRef.current || !manualCommitRef.current || !inWindow) {
+          log('[voice] ignoring transcript (still holding or server-committed)');
+          break;
+        }
+  
+        // Consume the window immediately so nothing else can slip in
+        manualCommitRef.current = false;
+        commitWindowUntilRef.current = 0;
+        turnCommittedRef.current = false;
+  
+        // 1) Show user bubble first
+        addMessage('user', text);
+        transcriptRef.current.push({ role:'user', text, ts:Date.now() });
+        lastUserTextRef.current = text;
+  
+        // Ensure bubble is painted before assistant starts
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  
+        // 2) Update visuals (summary/state/proposals)
+        addAndReconcileForUserTurn(text, 'live').catch(()=>{});
+        try {
+          const [sum, st, prop] = await Promise.all([
+            postJSON('/summary', { transcript: transcriptRef.current.slice(-30), mode:'live' }),
+            postJSON('/state',   { transcript: transcriptRef.current.filter(t=>t.role==='user').slice(-30), mode:'live' }),
+            postJSON('/propose', { transcript: transcriptRef.current.slice(-30), focus: defPackRef.current||'', mode:'live' })
+          ]);
+          if (sum?.summary){ setSummary(sum.summary); summaryRef.current = sum.summary; }
+          if (st?.state)    { applyStatePatch({ add: st.state }); }
+          if (prop?.proposals?.length) enqueueProposals(prop.proposals.map(p=>({ ...p, source:'scout' })));
+        } catch(e){ log('[turn helpers err]', e?.message||e); }
+  
+        // 3) Now ask the assistant to reply (same policy as typed turns)
+        const policy = speakPolicyRef.current;  // 'confirm' | 'auto' | 'text'
+        // If the user explicitly said "go ahead", treat it like auto for this turn
+        const shouldSpeakThisTurn = isVoiceConfirmation(text) || policy === 'auto';
+        const modalities = shouldSpeakThisTurn ? ['text','audio'] : ['text'];
 
-      // Audio cleared after cancel — safe to unmute if not holding PTT
+        // We already have a conversation item for the audio turn, so we can directly request a response.
+        expectResponseRef.current = true;
+        safeSend({
+          type:'response.create',
+          response:{ modalities, instructions: buildSystemCtx() }
+        });
+
+        // If policy is 'confirm', also stage the confirm button to allow a follow-up *voice* turn later.
+        if (policy === 'confirm') {
+          pendingSpeakRef.current = { kind:'follow_up', instructions: buildSystemCtx() };
+          setConfirmUI(true, '✅ Confirm & Speak');
+        }
+        break;
+      }
+  
       case 'output_audio_buffer.cleared': {
         if (unmuteWhenClearedRef.current && !pttActiveRef.current) {
           setAssistantMuted(false);
@@ -767,108 +1049,159 @@ export default function App(){
         }
         break;
       }
-
+  
       case 'output_audio_buffer.started': {
         assistantSpeakingRef.current = true;
         try { micSenderRef.current?.replaceTrack(null); } catch {}
+        upsertAssistantStream();
         break;
       }
-
-      // ---- Tool streaming (respond on arguments.done) ----
+  
+      case 'input_audio_buffer.speech_started': {
+        turnCommittedRef.current = false;
+        break;
+      }
+  
+      case 'input_audio_buffer.committed': {
+        turnCommittedRef.current = true;
+        break;
+      }
+  
+      // Tool streaming — no-op ACKs (avoid tool_outputs errors on Realtime)
       case 'response.function_call_arguments.delta': {
-        const id   = ev?.call_id || ev?.tool_call_id || ev?.id;
-        const name = ev?.name    || ev?.tool_name;
-        if (!id) break;
-        const entry = toolBufRef.current.get(id) || { name, args: '' };
-        entry.args += ev?.delta || '';
-        if (name && !entry.name) entry.name = name;
-        toolBufRef.current.set(id, entry);
+        // swallow; we don't need to build args for this app flow
         break;
       }
       case 'response.function_call_arguments.done': {
-        const id   = ev?.call_id || ev?.tool_call_id || ev?.id;
-        if (!id) break;
-        const entry = toolBufRef.current.get(id);
-        let args = {};
-        try { args = entry?.args ? JSON.parse(entry.args) : {}; } catch {}
-        toolBufRef.current.delete(id);
-        const name = entry?.name || ev?.name || ev?.tool_name || '';
-
-        if (name === 'definition.greeter') {
-          const status = (args.status || args.phase || '').toString().toLowerCase();
-          const pack   = args.pack || args.definition_pack || null;
-        
-          // Keep capturing partials as the conversation flows
-          if (pack) {
-            defPackRef.current = pack; // stash latest partial/complete pack
-          }
-        
-          // If the greeter marks completion (or we get a good pack), close the gate
-          if (status === 'complete' || args.complete === true || pack) {
-            consentRef.current  = true;
-            gateOpenRef.current = false;
-        
-            // Immediate, short acknowledgement (no confirmation required here)
-            performingSpeakRef.current = true;
-            speakGateRef.current = false;
-            safeSend({
-              type:'response.create',
-              response:{
-                modalities:['audio','text'],
-                instructions:'Great — I captured the decision definition. When you want me to continue, say "go ahead" or press Confirm.'
-              }
-            });
-        
-            // Next turns will be gated again
-            setTimeout(()=>{ speakGateRef.current = true; }, 0);
-        
-            sendToolOutput(id, { ok:true });
-            return;
-          }
-        
-          // Still collecting → stay in Definition Gate; the model will ask the next short question
-          sendToolOutput(id, { ok:true });
-          return;
-        }
-        
-        const clean = sanitizePatch(args);
-        if (name === 'update_state') {
-          if (clean) applyStatePatch(clean);
-          sendToolOutput(id, { ok: true });
-        } else if (name === 'persist_session') {
-          sendToolOutput(id, { ok: true, session_id: 'dev-local' });
-        } else {
-          sendToolOutput(id, { ok: false, reason: 'unsupported tool' });
+        // If you want, inspect ev.name / ev.call_id here and update state directly;
+        // we intentionally avoid sending tool_outputs back on Realtime to prevent 400s.
+        break;
+      }
+  
+      case 'response.audio_transcript.done': {
+        const text = (voiceTextBufRef.current || '').trim();
+        if (text) {
+          if (!currentAssistantMsgIdRef.current) upsertAssistantStream();
+          finalizeAssistantStream();
+          transcriptRef.current.push({ role: 'assistant', text, ts: Date.now() });
+          voiceTextBufRef.current = '';
+          refreshFinalSummary().catch(()=>{});
         }
         break;
       }
-
-      // ---- FINALIZE exactly once, keyed by response_id ----
+  
       case 'response.done': {
         const rid = ev?.response_id || ev?.id || null;
         if (!respPendingRef.current) break;
         if (currentResponseIdRef.current && rid && rid !== currentResponseIdRef.current) break;
-
+  
+        finalizeAssistantStream();
         respPendingRef.current = false;
         currentResponseIdRef.current = null;
-        finalizeTurn();   // triggers /state(final) + /summary and re-arms gate
+  
+        if (unmuteWhenClearedRef.current && !pttActiveRef.current) {
+          setAssistantMuted(false);
+          unmuteWhenClearedRef.current = false;
+        }
+  
+        finalizeTurn();
         break;
       }
-
-      case 'response.audio.done':
-      case 'response.completed':
-      case 'output_audio_buffer.stopped': {
+  
+      case 'error': {
+        const msg = ev?.error?.message || '';
+        if (ev?.error?.code === 'input_audio_buffer_commit_empty') {
+          manualCommitRef.current = false;
+          log('[commit] ignored empty buffer');
+        } else {
+          log('[event error]', ev);
+        }
         break;
       }
-
-      case 'error': { log('[event error]', ev); break; }
-      default: { if(ev.type) log('[event]', ev.type); }
+  
+      default: {
+        if (ev.type) log('[event]', ev.type);
+      }
     }
-
+  
     flushOutbox();
   }
+  
 
   // --- PTT ---
+
+  const speakPolicyRef = useRef('confirm'); // 'confirm' | 'auto' | 'text'
+  useEffect(()=>{
+    const sel = document.getElementById('speak-policy');
+    if (sel) sel.onchange = () => { speakPolicyRef.current = sel.value; };
+  },[]);
+
+  const chatRef = useRef([]); // [{id, role:'user'|'assistant', text, ts, turn_id}]
+
+  function renderChat(){
+    const el = document.getElementById('chat'); if (!el) return;
+    el.innerHTML = chatRef.current.map(m => `
+      <div style="margin:6px 0; display:flex; ${m.role==='user'?'justify-content:flex-end':''}">
+        <div style="max-width:70%; border:1px solid #ddd; border-radius:12px; padding:8px 10px; background:${m.role==='user'?'#e8f0fe':'#fff'}">
+          <div class="small" style="color:#666;margin-bottom:2px">${m.role==='user'?'You':'Assistant'} • ${new Date(m.ts).toLocaleTimeString()}</div>
+          <div>${escapeHtml(m.text)}</div>
+        </div>
+      </div>`).join('');
+    el.scrollTop = el.scrollHeight;
+  }
+  function addMessage(role, text, turn_id=null){
+    chatRef.current.push({ id: genId('m'), role, text, ts: Date.now(), turn_id });
+    renderChat();
+  }
+
+  // ---- Assistant streaming helpers ----
+  const currentAssistantMsgIdRef = React.useRef(null);
+
+  function upsertAssistantStream() {
+    // create a bubble once, then update its text on each delta
+    if (!currentAssistantMsgIdRef.current) {
+      const id = genId('m');
+      chatRef.current.push({
+        id,
+        role: 'assistant',
+        text: '',
+        ts: Date.now(),
+        streaming: true,
+        turn_id: currentResponseIdRef.current || null
+      });
+      currentAssistantMsgIdRef.current = id;
+    }
+    const msg = chatRef.current.find(m => m.id === currentAssistantMsgIdRef.current);
+    if (msg) {
+      msg.text = (voiceTextBufRef.current || '');
+      renderChat();
+    }
+  }
+
+  function finalizeAssistantStream() {
+    if (!currentAssistantMsgIdRef.current) return;
+    const msg = chatRef.current.find(m => m.id === currentAssistantMsgIdRef.current);
+    if (msg) {
+      msg.streaming = false;
+      msg.ts = Date.now();
+    }
+    currentAssistantMsgIdRef.current = null;
+    renderChat();
+  }
+
+
+  function openPropagationPanel(claimId){
+    console.warn('[propagation] openPropagationPanel not implemented yet', claimId);
+    // TODO: implement modal listing usages (in-sync / pinned / out-of-scope) with apply checkboxes
+  }
+
+  useEffect(()=>{
+    const box = document.getElementById('chat-input');
+    const send = document.getElementById('chat-send');
+    if (send) send.onclick = () => { const t=box.value.trim(); if(t){ onUserTextSend(t); box.value=''; } };
+    if (box) box.onkeydown = (e)=>{ if(e.key==='Enter'){ const t=box.value.trim(); if(t){ onUserTextSend(t); box.value=''; } } };
+  },[]);
+
   useEffect(()=>{
     function isTypingInInput(){
       const el=document.activeElement; if(!el) return false;
@@ -881,8 +1214,9 @@ export default function App(){
       if(assistantSpeakingRef.current) return;
       if(pttActiveRef.current) return;
 
-      pttActiveRef.current=true;
-      expectResponseRef.current=false;       // while holding, do NOT allow replies
+      pttActiveRef.current = true;
+      pttStartAtRef.current = Date.now();
+      manualCommitRef.current = false;           // not our commit yet
       setPTTActiveUI(true);
       pttBufferRef.current='';
 
@@ -900,15 +1234,25 @@ export default function App(){
       if(e.code!=='Space') return; if(isTypingInInput()) return;
       e.preventDefault(); if(!pttActiveRef.current) return;
 
-      pttActiveRef.current=false;
+      pttActiveRef.current = false;
       setPTTActiveUI(false);
 
-      // Stop local SR first
-      stopSpeech();
+
+      // ignore very short taps to avoid 0ms buffer errors
+      if (Date.now() - pttStartAtRef.current < MIN_PTT_MS) {
+        setAssistantMuted(false);
+        return;
+      }
+
+      manualCommitRef.current = true;            // next COMMIT is ours
+      commitWindowUntilRef.current = Date.now() + COMMIT_WINDOW_MS;
 
       // FORCE a commit of the server's audio buffer BEFORE detaching mic
       log('[ptt] committing input_audio_buffer');
       safeSend({ type:'input_audio_buffer.commit' });
+
+            // Stop local SR first
+      stopSpeech();
 
       // small tail for prosody and to let commit enqueue cleanly
       await new Promise(r=>setTimeout(r,150));
@@ -920,8 +1264,6 @@ export default function App(){
       pttBufferRef.current='';
       if (text) {
         log('[ptt local text]', text);
-        transcriptRef.current.push({ role:'user', text, ts:Date.now() });
-        lastUserTextRef.current = text;
         const local = localAddOnlyFromUser(text);   // optional immediate chips
         if (local) applyStatePatch(local);
       }
@@ -952,53 +1294,71 @@ export default function App(){
   }, []);
 
   // --- Connect / Disconnect ---
-  async function onConnect(){
-    setStatus('Connecting…');
-    try{
-      const conn=await connectRealtime(); connRef.current=conn;
-      micTrackRef.current=conn.micTrack;
-      micSenderRef.current=conn.micSender;
-      renderViz(document.getElementById('viz'), stateRef.current);
-      conn.setHandler(handleServerEvent);
+ // ---- onConnect (sets up session and triggers greeting) ----
+async function onConnect(){
+  setStatus('Connecting…');
+  try{
+    const conn = await connectRealtime();
+    connRef.current = conn;
 
-      try{ micSenderRef.current?.replaceTrack(null); }catch{}
+    micTrackRef.current  = conn.micTrack;
+    micSenderRef.current = conn.micSender;
 
-      const arm = () => {
-        if (onConnect.didConfig) return;
-        onConnect.didConfig = true;
-      
-        log('[session.update] voice+transcription+VAD');
-        safeSend({
-          type: 'session.update',
-          session: {
-            voice: 'alloy',
-            input_audio_transcription: { model: 'whisper-1' },
-            turn_detection: { type: 'server_vad', threshold: 0.6, silence_duration_ms: 700 }
-          }
-        });
-      
-        // Keep mic detached so the greeter can't hear itself
-        try { micSenderRef.current?.replaceTrack(null); } catch {}
-        setAssistantMuted(false);
-      
-        // Open the gate for definition
-        gateOpenRef.current = true;
-        consentRef.current  = false;
-        defPackRef.current  = null;
-      
-        setStatus('Connected. Define the decision to begin.');
-        sendDefinitionGreeter();        // speak-once greeter (audio)
-        flushOutbox();
-      };
-      if(conn.dc?.readyState==='open'){ arm(); } else { conn.dc?.addEventListener('open', arm); }
+    renderViz(document.getElementById('viz'), stateRef.current);
+    if (typeof updateCoverageCounters === 'function') updateCoverageCounters();
 
-      const flusher=setInterval(flushOutbox,200);
-      conn.pc.onconnectionstatechange=()=>{ if(['failed','closed','disconnected'].includes(conn.pc.connectionState)) clearInterval(flusher); };
-    }catch(err){
-      setStatus(`Error: ${/** @type {Error} */(err).message}`);
-      log('[connect error]', err);
-    }
+    conn.setHandler(handleServerEvent);
+    try { micSenderRef.current?.replaceTrack(null); } catch {}
+
+    const arm = () => {
+      if (onConnect.didConfig) return;
+      onConnect.didConfig = true;
+
+      log('[session.update] voice+transcription');
+      // Manual-commit PTT (omit turn_detection entirely)
+      safeSend({
+        type: 'session.update',
+        session: {
+          voice: 'alloy',
+          input_audio_transcription: { model: 'whisper-1' }
+        }
+      });
+
+      // Don’t let the assistant hear itself
+      try { micSenderRef.current?.replaceTrack(null); } catch {}
+      setAssistantMuted(false);
+
+      // Open the definition-gate UX
+      gateOpenRef.current = true;
+      consentRef.current  = false;
+      defPackRef.current  = null;
+
+      setStatus('Connected. Define the decision to begin.');
+
+      // ✅ Make the router allow the greeting:
+      // mark a “committed” moment and set expected reply BEFORE sending
+      turnCommittedRef.current  = true;
+      expectResponseRef.current = true;
+
+      // Fire the greeting
+      sendDefinitionGreeter();
+
+      flushOutbox();
+    };
+
+    if (conn.dc?.readyState === 'open') { arm(); }
+    else { conn.dc?.addEventListener('open', arm); }
+
+    const flusher = setInterval(flushOutbox, 200);
+    conn.pc.onconnectionstatechange = () => {
+      if (['failed','closed','disconnected'].includes(conn.pc.connectionState)) clearInterval(flusher);
+    };
+  } catch (err){
+    setStatus(`Error: ${/** @type {Error} */(err).message}`);
+    log('[connect error]', err);
   }
+}
+
 
   function onDisconnect(){
     try{ connRef.current?.stop?.(); }catch{}

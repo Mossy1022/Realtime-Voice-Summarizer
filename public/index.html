@@ -20,9 +20,23 @@
   <body>
     <h1>Realtime Voice Summary</h1>
     <div class="row">
+      <span class="small">Voice:</span>
+        <select id="speak-policy">
+          <option value="confirm">Confirm & Speak</option>
+          <option value="auto">Auto Speak</option>
+          <option value="text">Text-only</option>
+        </select>
       <button id="connect">Connect + Mic</button>
       <button id="disconnect" disabled>Disconnect</button>
       <span id="status" class="small">Idle</span>
+    </div>
+
+    <h3>Chat</h3>
+    <div id="chat" style="border:1px solid #ddd;border-radius:8px;padding:12px;min-height:160px;max-height:360px;overflow:auto"></div>
+
+    <div class="row" style="margin-top:8px;gap:8px">
+      <input id="chat-input" placeholder="Type and press Enter…" style="flex:1;min-width:260px;padding:8px;border:1px solid #ddd;border-radius:6px" />
+      <button id="chat-send">Send</button>
     </div>
 
     <h3>Summary (auto-updates after each turn)</h3>
@@ -36,6 +50,8 @@
     <div style="margin-top:8px;">
         <button onclick="alert('PV hand-off coming soon')">Open in Perspective Visualizer</button>
     </div>
+    <div id="focus-title" class="small" style="margin-top:8px;color:#444">Focus: (unset)</div>
+    <div id="coverage" class="small" style="margin-top:4px;color:#666">anchors 0/0 • reviewed 0% • fresh 0%</div>
 
     <audio id="assistant-audio" autoplay playsinline controls></audio>
 
